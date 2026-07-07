@@ -14,6 +14,7 @@ export type AgentSession = {
   approvalCommand?: string;
   lastCompletionAt?: string;
   reviewedAt?: string;
+  usage?: AgentUsage;
 };
 
 export type AgentSummary = {
@@ -37,6 +38,17 @@ export type AgentUsage = {
   primary?: AgentUsageWindow;
   secondary?: AgentUsageWindow;
   planType?: string;
+  totalTokenUsage?: AgentTokenUsage;
+  lastTokenUsage?: AgentTokenUsage;
+  modelContextWindow?: number;
+};
+
+export type AgentTokenUsage = {
+  inputTokens?: number;
+  cachedInputTokens?: number;
+  outputTokens?: number;
+  reasoningOutputTokens?: number;
+  totalTokens?: number;
 };
 
 export type AgentScan = {

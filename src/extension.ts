@@ -87,7 +87,14 @@ class DoneNotifier {
     this.polling = true;
     try {
       const cfg = this.getConfig();
-      const scan = await scanAgents(cfg, this.reviewState.getReviewed());
+      let scan = await scanAgents(cfg, this.reviewState.getReviewed());
+      const runningReviewedIds = scan.sessions
+        .filter((session) => session.status === "running" && session.reviewedAt)
+        .map((session) => session.id);
+      if (runningReviewedIds.length > 0) {
+        await this.reviewState.markUnreviewed(runningReviewedIds);
+        scan = await scanAgents(cfg, this.reviewState.getReviewed());
+      }
       this.updateStatusBar(scan.sessions);
       if (cfg.notifyOnDone) {
         await this.notifyTransitions(scan.sessions);
@@ -181,8 +188,7 @@ class DoneNotifier {
       }
 
       if (choice === "Mark Reviewed") {
-        await this.reviewState.markReviewed([session.id]);
-        await this.dashboard.refresh();
+        await this.dashboard.markReviewed(session.id);
       }
     }
   }

@@ -4,7 +4,7 @@ import * as path from "path";
 import { promisify } from "util";
 import type { AgentMonitorConfig } from "./config";
 import type { ReviewMap } from "./reviewState";
-import type { AgentScan, AgentSession, AgentStatus, AgentSummary, AgentUsage } from "./types";
+import type { AgentScan, AgentSession, AgentStatus, AgentSummary, AgentTokenUsage, AgentUsage } from "./types";
 
 const execFileAsync = promisify(execFile);
 
@@ -74,7 +74,8 @@ function buildAgentSession(
     approvalReason: transcript?.approvalReason,
     approvalCommand: transcript?.approvalCommand,
     lastCompletionAt: transcript?.lastCompletionAt,
-    reviewedAt
+    reviewedAt,
+    usage: transcript?.usage
   };
 }
 
@@ -219,6 +220,7 @@ async function readTranscriptInfo(transcriptPath: string, archived: boolean): Pr
           arguments?: string;
           call_id?: string;
           rate_limits?: unknown;
+          info?: unknown;
         };
       };
       const timestampMs = parseTime(parsed.timestamp) ?? 0;
@@ -307,20 +309,34 @@ async function readTranscriptInfo(transcriptPath: string, archived: boolean): Pr
   };
 }
 
-function parseUsage(timestamp: string | undefined, payload: { rate_limits?: unknown }): AgentUsage | undefined {
-  if (!timestamp || typeof payload.rate_limits !== "object" || payload.rate_limits === null) {
+function parseUsage(timestamp: string | undefined, payload: { rate_limits?: unknown; info?: unknown }): AgentUsage | undefined {
+  if (!timestamp) {
     return undefined;
   }
 
-  const rateLimits = payload.rate_limits as {
+  const rateLimits =
+    typeof payload.rate_limits === "object" && payload.rate_limits !== null
+      ? (payload.rate_limits as {
     primary?: unknown;
     secondary?: unknown;
     plan_type?: unknown;
-  };
+        })
+      : {};
+  const info =
+    typeof payload.info === "object" && payload.info !== null
+      ? (payload.info as {
+          total_token_usage?: unknown;
+          last_token_usage?: unknown;
+          model_context_window?: unknown;
+        })
+      : {};
 
   const primary = parseUsageWindow(rateLimits.primary);
   const secondary = parseUsageWindow(rateLimits.secondary);
-  if (!primary && !secondary) {
+  const totalTokenUsage = parseTokenUsage(info.total_token_usage);
+  const lastTokenUsage = parseTokenUsage(info.last_token_usage);
+  const modelContextWindow = typeof info.model_context_window === "number" ? info.model_context_window : undefined;
+  if (!primary && !secondary && !totalTokenUsage && !lastTokenUsage && modelContextWindow === undefined) {
     return undefined;
   }
 
@@ -328,7 +344,10 @@ function parseUsage(timestamp: string | undefined, payload: { rate_limits?: unkn
     capturedAt: timestamp,
     primary,
     secondary,
-    planType: typeof rateLimits.plan_type === "string" ? rateLimits.plan_type : undefined
+    planType: typeof rateLimits.plan_type === "string" ? rateLimits.plan_type : undefined,
+    totalTokenUsage,
+    lastTokenUsage,
+    modelContextWindow
   };
 }
 
@@ -347,6 +366,33 @@ function parseUsageWindow(value: unknown): AgentUsage["primary"] {
     windowMinutes: window.window_minutes,
     resetsAt: typeof window.resets_at === "number" ? window.resets_at : undefined
   };
+}
+
+function parseTokenUsage(value: unknown): AgentTokenUsage | undefined {
+  if (typeof value !== "object" || value === null) {
+    return undefined;
+  }
+
+  const usage = value as {
+    input_tokens?: unknown;
+    cached_input_tokens?: unknown;
+    output_tokens?: unknown;
+    reasoning_output_tokens?: unknown;
+    total_tokens?: unknown;
+  };
+  const parsed = {
+    inputTokens: readNumber(usage.input_tokens),
+    cachedInputTokens: readNumber(usage.cached_input_tokens),
+    outputTokens: readNumber(usage.output_tokens),
+    reasoningOutputTokens: readNumber(usage.reasoning_output_tokens),
+    totalTokens: readNumber(usage.total_tokens)
+  };
+
+  return Object.values(parsed).some((item) => item !== undefined) ? parsed : undefined;
+}
+
+function readNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function extractUserMessage(payload: { message?: string; content?: Array<{ type?: string; text?: string }> } | undefined): string | undefined {

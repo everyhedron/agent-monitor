@@ -1,6 +1,6 @@
 import * as os from "os";
 import * as vscode from "vscode";
-import { updateStartupOptions, type AgentMonitorConfig } from "./config";
+import { updateAgentMonitorOptions, type AgentMonitorConfig } from "./config";
 import { ReviewState } from "./reviewState";
 import { scanAgents } from "./scanner";
 import type { AgentScan, AgentSession, AgentStatus } from "./types";
@@ -12,7 +12,7 @@ type DashboardMessage = {
   sessionId?: string;
   sessionIds?: string[];
   path?: string;
-  setting?: "openOnStartup" | "pinOnStartup";
+  setting?: "openOnStartup" | "pinOnStartup" | "autoCompactOnReview";
   value?: boolean;
 };
 
@@ -20,6 +20,7 @@ export class Dashboard {
   private panel: vscode.WebviewPanel | undefined;
   private timer: NodeJS.Timeout | undefined;
   private lastScan: AgentScan | undefined;
+  private refreshPromise: Promise<AgentScan> | undefined;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -86,7 +87,27 @@ export class Dashboard {
   }
 
   async refresh(): Promise<AgentScan> {
-    const scan = await scanAgents(this.getConfig(), this.reviewState.getReviewed());
+    if (this.refreshPromise) {
+      return this.refreshPromise;
+    }
+
+    this.refreshPromise = this.doRefresh();
+    try {
+      return await this.refreshPromise;
+    } finally {
+      this.refreshPromise = undefined;
+    }
+  }
+
+  private async doRefresh(): Promise<AgentScan> {
+    let scan = await scanAgents(this.getConfig(), this.reviewState.getReviewed());
+    const runningReviewedIds = scan.sessions
+      .filter((session) => session.status === "running" && session.reviewedAt)
+      .map((session) => session.id);
+    if (runningReviewedIds.length > 0) {
+      await this.reviewState.markUnreviewed(runningReviewedIds);
+      scan = await scanAgents(this.getConfig(), this.reviewState.getReviewed());
+    }
     this.lastScan = scan;
     if (this.panel) {
       this.panel.webview.html = renderDashboard(scan, this.getConfig());
@@ -145,13 +166,12 @@ export class Dashboard {
       }
 
       if (message.command === "updateStartupSetting" && message.setting) {
-        await updateStartupOptions({ [message.setting]: message.value === true });
+        await updateAgentMonitorOptions({ [message.setting]: message.value === true });
         return;
       }
 
       if (message.command === "markReviewed" && message.sessionId) {
-        await this.reviewState.markReviewed([message.sessionId]);
-        await this.refresh();
+        await this.markReviewed(message.sessionId);
         return;
       }
 
@@ -194,6 +214,29 @@ export class Dashboard {
 
     existingTerminal.show();
     existingTerminal.sendText(approval);
+  }
+
+  async markReviewed(sessionId: string): Promise<void> {
+    await this.reviewState.markReviewed([sessionId]);
+    if (this.getConfig().autoCompactOnReview) {
+      await this.sendCompact(sessionId);
+    }
+    await this.refresh();
+  }
+
+  private async sendCompact(sessionId: string): Promise<void> {
+    const session = this.lastScan?.sessions.find((session) => session.id === sessionId);
+    const terminalName = terminalNameForSession(session?.name);
+    const existingTerminal = vscode.window.terminals.find((terminal) => terminal.name === terminalName);
+    if (existingTerminal) {
+      existingTerminal.show();
+      existingTerminal.sendText("/compact");
+      return;
+    }
+
+    this.openAgent(sessionId);
+    await vscode.env.clipboard.writeText("/compact");
+    void vscode.window.showWarningMessage(`Auto compact failed for ${terminalName}. Paste /compact into the terminal manually.`);
   }
 
   private async pinPanel(): Promise<void> {
@@ -523,6 +566,16 @@ function renderDashboard(scan: AgentScan, config: AgentMonitorConfig): string {
       overflow: hidden;
     }
 
+    .session-usage {
+      display: grid;
+      gap: 5px;
+      min-width: 150px;
+    }
+
+    .session-usage .usage-track {
+      height: 6px;
+    }
+
     .badge {
       border: 1px solid var(--border);
       border-radius: 999px;
@@ -590,17 +643,17 @@ function renderDashboard(scan: AgentScan, config: AgentMonitorConfig): string {
     <header>
       <div>
         <h1>Agent Monitor</h1>
-        <div class="summary" title="${escapeAttr(summaryTitle)}">${scan.summary.total} sessions · Refreshing in <span id="refresh-countdown">${refreshSeconds}</span>s</div>
+        <div class="summary" title="${escapeAttr(summaryTitle)}">${scan.summary.total} sessions · <span id="refresh-status">Refreshing in <span id="refresh-countdown">${refreshSeconds}</span>s</span></div>
       </div>
       <div class="header-actions">
         <label class="checkbox-control"><input type="checkbox" data-setting="openOnStartup" ${config.openOnStartup ? "checked" : ""}> Open on startup</label>
         <label class="checkbox-control"><input type="checkbox" data-setting="pinOnStartup" ${config.pinOnStartup ? "checked" : ""}> Pin on startup</label>
+        <label class="checkbox-control"><input type="checkbox" data-setting="autoCompactOnReview" ${config.autoCompactOnReview ? "checked" : ""}> Auto compact on review</label>
         <button type="button" data-command="refresh">Refresh</button>
       </div>
     </header>
 
     <section class="stats" aria-label="Agent chat summary">
-      ${renderStat("Total", scan.summary.total, "all")}
       ${renderStat("Running", scan.summary.running, "running")}
       ${renderStat("Needs Approval", scan.summary.needsApproval, "needs-approval")}
       ${renderStat("Done", scan.summary.doneReview, "done-review")}
@@ -626,6 +679,7 @@ function renderDashboard(scan: AgentScan, config: AgentMonitorConfig): string {
             <th>Chat</th>
             <th>Status</th>
             <th>Updated</th>
+            <th>Usage</th>
             <th>Last User</th>
             <th>Last Message</th>
             <th>Actions</th>
@@ -640,7 +694,9 @@ function renderDashboard(scan: AgentScan, config: AgentMonitorConfig): string {
     const vscode = acquireVsCodeApi();
     const persistedState = vscode.getState() || {};
     const selectedStatuses = new Set(persistedState.selectedStatuses || []);
-    let countdown = ${refreshSeconds};
+    const refreshSeconds = ${refreshSeconds};
+    let countdown = refreshSeconds;
+    let refreshing = false;
 
     function persistState(extra = {}) {
       vscode.setState({
@@ -673,14 +729,44 @@ function renderDashboard(scan: AgentScan, config: AgentMonitorConfig): string {
       persistState();
     }
 
+    function setRefreshStatus() {
+      const status = document.getElementById("refresh-status");
+      const countdownElement = document.getElementById("refresh-countdown");
+      if (!status) {
+        return;
+      }
+      if (refreshing) {
+        status.textContent = "Refreshing...";
+        return;
+      }
+      status.innerHTML = 'Refreshing in <span id="refresh-countdown">' + countdown + '</span>s';
+      const nextCountdownElement = document.getElementById("refresh-countdown") || countdownElement;
+      if (nextCountdownElement) {
+        nextCountdownElement.textContent = String(countdown);
+      }
+    }
+
+    function requestRefresh() {
+      if (refreshing) {
+        return;
+      }
+      refreshing = true;
+      setRefreshStatus();
+      vscode.postMessage({ command: "refresh" });
+    }
+
     showMode(persistedState.viewMode || "cards");
     applyStatusFilter();
 
     setInterval(() => {
+      if (refreshing) {
+        return;
+      }
       countdown = Math.max(0, countdown - 1);
-      const element = document.getElementById("refresh-countdown");
-      if (element) {
-        element.textContent = String(countdown);
+      if (countdown === 0) {
+        requestRefresh();
+      } else {
+        setRefreshStatus();
       }
     }, 1000);
 
@@ -707,6 +793,11 @@ function renderDashboard(scan: AgentScan, config: AgentMonitorConfig): string {
 
       const button = event.target.closest("button[data-command]");
       if (!button) {
+        return;
+      }
+
+      if (button.dataset.command === "refresh") {
+        requestRefresh();
         return;
       }
 
@@ -755,6 +846,8 @@ function renderSessionCard(session: AgentSession): string {
       <dd><div class="message" title="${escapeAttr(session.lastUserMessage || "")}">${escapeHtml(truncateLines(session.lastUserMessage || "No user message found."))}</div></dd>
       <dt>Agent</dt>
       <dd><div class="message" title="${escapeAttr(session.lastMessage || "")}">${escapeHtml(truncateLines(session.lastMessage || "No agent message found."))}</div></dd>
+      <dt>Usage</dt>
+      <dd>${renderSessionUsage(session)}</dd>
       <dt>Actions</dt>
       <dd><div class="actions">${renderActions(session)}</div></dd>
     </dl>
@@ -773,10 +866,36 @@ function renderSessionRow(session: AgentSession): string {
       ${session.lastCompletionAt ? `<div class="meta">completed ${escapeHtml(formatDate(session.lastCompletionAt))}</div>` : ""}
       ${session.reviewedAt ? `<div class="meta">reviewed ${escapeHtml(formatDate(session.reviewedAt))}</div>` : ""}
     </td>
+    <td>${renderSessionUsage(session)}</td>
     <td><div class="message" title="${escapeAttr(session.lastUserMessage || "")}">${escapeHtml(truncateLines(session.lastUserMessage || "No user message found."))}</div></td>
     <td><div class="message" title="${escapeAttr(session.lastMessage || "")}">${escapeHtml(truncateLines(session.lastMessage || "No agent message found."))}</div></td>
     <td><div class="actions">${renderActions(session)}</div></td>
   </tr>`;
+}
+
+function renderSessionUsage(session: AgentSession): string {
+  const usage = session.usage;
+  if (!usage) {
+    return `<div class="meta">No usage data</div>`;
+  }
+
+  const totalTokens = usage.totalTokenUsage?.totalTokens;
+  const contextTokens = usage.lastTokenUsage?.inputTokens;
+  const contextWindow = usage.modelContextWindow;
+  const contextPercent =
+    contextTokens !== undefined && contextWindow !== undefined && contextWindow > 0
+      ? Math.max(0, Math.min(100, (contextTokens / contextWindow) * 100))
+      : undefined;
+  const contextTitle =
+    contextTokens !== undefined && contextWindow !== undefined
+      ? `${formatNumber(contextTokens)} / ${formatNumber(contextWindow)} tokens`
+      : "Context window unavailable";
+
+  return `<div class="session-usage">
+    <div class="meta">Total ${totalTokens !== undefined ? escapeHtml(formatNumber(totalTokens)) : "unknown"} tokens</div>
+    <div class="meta" title="${escapeAttr(contextTitle)}">Context ${contextPercent !== undefined ? `${Math.round(contextPercent)}%` : "unknown"}</div>
+    <div class="usage-track" title="${escapeAttr(contextTitle)}"><div class="usage-fill" style="width: ${contextPercent ?? 0}%"></div></div>
+  </div>`;
 }
 
 function renderActions(session: AgentSession): string {
@@ -877,6 +996,10 @@ function formatDate(value: string | number | undefined): string {
 
 function formatUnixSeconds(value: number | undefined): string {
   return value ? formatDate(value * 1000) : "unknown";
+}
+
+function formatNumber(value: number): string {
+  return new Intl.NumberFormat().format(value);
 }
 
 function escapeHtml(value: string): string {

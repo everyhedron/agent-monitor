@@ -69,6 +69,11 @@
           "type": "boolean",
           "default": false,
           "description": "Pin the Agent Monitor dashboard tab when it opens on VS Code startup."
+        },
+        "agentMonitor.autoCompactOnReview": {
+          "type": "boolean",
+          "default": false,
+          "description": "Send /compact to the agent terminal when a chat is marked reviewed."
         }
       }
     }

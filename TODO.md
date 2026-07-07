@@ -1,14 +1,4 @@
-- [x] please initialize git and use "git@github.com:everyhedron/agent-monitor.git" as remote. there is an MIT licence on the remote that we should pull and use. stage, commit, and push all changes.
-- [x] currently the agent monitor and the project monitor have different ways of tracking the terminal name and if a session is already existing. we need them to be identical. do not include the id in the name of the terminal. just use "Project Name | Codex". if the logic in Project Monitor is not optimized, write below this line what are the isses, because earlier I used project monitor to start a agent terminal for agent monitor, and it created a new "Agent Monitor | Codex" instead of focusing the existing one. Do not edit the project monitor app, write me the diagnosis. 
-
-Project Monitor diagnosis:
-
-Project Monitor names agent terminals as `Project Name | Codex`, but it tracks reuse with an in-memory `Map` keyed by `agent:${projectPath}`. That map is only populated for terminals Project Monitor itself created during the current extension-host lifetime. If a terminal already exists from another source, or if VS Code reloads and the map is empty, Project Monitor does not scan `vscode.window.terminals` by terminal name. It will create a new `Agent Monitor | Codex` instead of focusing the existing one. Agent Monitor now uses the same terminal name format, but it checks `vscode.window.terminals` by name before creating a terminal.
-
-- [x] for archived chats, remove the "Review/Unreview" buttons
-- [x] same as project monitor whichever viewing mode is active, make it blue, the other one white. do not make both blue.
-- [x] make the status sum cards on the top togglable by clicking. if nothing is selected, it will show all chats. if some are selected it will show only chats of those statuses.
-- [x] for this line "/home/django/.codex · refreshed 7/7/2026, 12:24:12 PM · every 5s · reviewed saved in VS Code global state" keep it as clean as project monitor. n sessions (hover will show the count for each status), Refreshing in [countdown]s.
+- [x] it gets stuck at 0s forever "6 sessions · Refreshing in 0s" check the logic to see why its doing that. if the refresh genuinly takes so long, it should be changed to "Refreshing..." while it is actually refreshing, and keep restart the counter after it refreshes.
 - [x] on the top we also want to have a usage traking the 5h usage, reset times, and 7 day limit. is this an information that is available in each session files? if so, write below what information we have available, i will choose which ones to include for each card. if information are available, implement the total 5h and 7d usage bar with reset times. if not, write below your suggestion. 
 
 Usage information available:
@@ -23,8 +13,14 @@ Codex session transcripts include `event_msg` entries where `payload.type` is `t
 - `payload.rate_limits.plan_type`: current plan label, for example `plus`.
 
 Agent Monitor now uses the latest transcript `token_count` event to render total 5h and 7d usage bars with reset times.
-- [x] Similar to project monitor, we want on the button status bar an icon with a x/y number. x is number of items needing review or needing approval, y is the total number of chats. when hovering it will display count for each status. and clicking will open or focus the page.
+
+- [x] we would also like a per session cumulative usage, and the current context window. total token usage is a number, while context window is a bar relative to the auto compaction limit, when hovering it will show the actual number.
+
+Per-session usage now uses the latest `token_count` entry in that session transcript. It displays cumulative `total_token_usage.total_tokens`, plus a context bar using latest turn `last_token_usage.input_tokens / model_context_window`. Hovering the context bar shows the raw token count and context window.
 - [x] add an approve button and always approve buttons on the needs approval notification, as well as change the "Reviewed" button on the page to the two buttons. which will send a y or p to that terminal respectively. for anything that is running, we can hide the reviewed button. the notification for approval should also include this part of the message (reason and the command also the name of the agent session) "  Reason: Allow reinstalling the packaged Project Monitor extension through the VS Code server.
  
   $ code --install-extension /home/django/everyhedron/project-monitor/project-monitor-0.0.10.vsix
   --force"
+- [x] the reviewed tag should to cleared for a project if it ever becomes running after one marked it as reviewed.
+- [x] add a auto compact on review checkbox at the top, will will submit a "/compact" message to the corresponding terminal, if auto compact has not been sent due to the terminal already closed, open the agent terminal and copy the /compact command to clipboard, and pop up a notification saying auto compact failed, please paste command to terminal manually.
+- [x] you can omit the Total card on top, the default without selecting anything would be total.
