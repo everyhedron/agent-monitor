@@ -20,3 +20,6 @@ Codex response: Approval notifications now use separate lines: `Approval needed`
 - [x] ![alt text](image-2.png) for agent finished notification, we should have just which agent finished, a truncated version of its last message. and info in terms of its usage for the last run. and for buttons, we dont want the mark reviewd. we want an open agent button.
 
 Codex response: Finished notifications now show the agent name, truncated last agent message, and last-run usage (`tokens`, `5h`, `7d`). Buttons are now `Open Monitor` and `Open Agent`; `Mark Reviewed` was removed.
+- [x] similar to project monitor, instead of having a Open button, make the id clickable and do what the open button would do. same for transcript button, remove it and move the function to a clickable agent last response
+
+Codex response: Removed the Open and Transcript action buttons. The session id now opens/resumes the agent terminal, and the agent last-response text opens the transcript when a transcript path exists.

@@ -590,6 +590,26 @@ function renderDashboard(scan: AgentScan, config: AgentMonitorConfig): string {
       color: color-mix(in srgb, var(--muted) 75%, transparent);
     }
 
+    .inline-action {
+      appearance: none;
+      background: transparent;
+      border: 0;
+      color: var(--vscode-textLink-foreground);
+      cursor: pointer;
+      display: inline;
+      font: inherit;
+      min-height: 0;
+      padding: 0;
+      text-align: left;
+      text-decoration: underline;
+      text-decoration-thickness: 1px;
+      text-underline-offset: 2px;
+    }
+
+    .inline-action:hover {
+      color: var(--vscode-textLink-activeForeground);
+    }
+
     .message {
       display: -webkit-box;
       -webkit-box-orient: vertical;
@@ -839,20 +859,20 @@ function renderDashboard(scan: AgentScan, config: AgentMonitorConfig): string {
         return;
       }
 
-      const button = event.target.closest("button[data-command]");
-      if (!button) {
+      const commandElement = event.target.closest("[data-command]");
+      if (!commandElement) {
         return;
       }
 
-      if (button.dataset.command === "refresh") {
+      if (commandElement.dataset.command === "refresh") {
         requestRefresh();
         return;
       }
 
       vscode.postMessage({
-        command: button.dataset.command,
-        sessionId: button.dataset.sessionId,
-        path: button.dataset.path
+        command: commandElement.dataset.command,
+        sessionId: commandElement.dataset.sessionId,
+        path: commandElement.dataset.path
       });
     });
 
@@ -879,7 +899,7 @@ function renderSessionCard(session: AgentSession): string {
     <div class="card-top">
       <div>
         <h2>${escapeHtml(session.name)}</h2>
-        <div class="meta session-id">${escapeHtml(session.id)}</div>
+        <div class="meta session-id">${renderOpenSessionLink(session)}</div>
       </div>
       ${renderStatus(session.status)}
     </div>
@@ -893,7 +913,7 @@ function renderSessionCard(session: AgentSession): string {
       <dt>User</dt>
       <dd><div class="message" title="${escapeAttr(session.lastUserMessage || "")}">${escapeHtml(truncateLines(session.lastUserMessage || "No user message found."))}</div></dd>
       <dt>Agent</dt>
-      <dd><div class="message" title="${escapeAttr(session.lastMessage || "")}">${escapeHtml(truncateLines(session.lastMessage || "No agent message found."))}</div></dd>
+      <dd>${renderAgentMessage(session)}</dd>
       <dt>Usage</dt>
       <dd>${renderSessionUsage(session)}</dd>
       <dt>Actions</dt>
@@ -906,7 +926,7 @@ function renderSessionRow(session: AgentSession): string {
   return `<tr data-session-status="${escapeAttr(session.status)}">
     <td>
       <div class="name">${escapeHtml(session.name)}</div>
-      <div class="meta session-id">${escapeHtml(session.id)}</div>
+      <div class="meta session-id">${renderOpenSessionLink(session)}</div>
     </td>
     <td>${renderStatus(session.status)}</td>
     <td>
@@ -916,9 +936,24 @@ function renderSessionRow(session: AgentSession): string {
     </td>
     <td>${renderSessionUsage(session)}</td>
     <td><div class="message" title="${escapeAttr(session.lastUserMessage || "")}">${escapeHtml(truncateLines(session.lastUserMessage || "No user message found."))}</div></td>
-    <td><div class="message" title="${escapeAttr(session.lastMessage || "")}">${escapeHtml(truncateLines(session.lastMessage || "No agent message found."))}</div></td>
+    <td>${renderAgentMessage(session)}</td>
     <td><div class="actions">${renderActions(session)}</div></td>
   </tr>`;
+}
+
+function renderOpenSessionLink(session: AgentSession): string {
+  return `<button class="inline-action" type="button" data-command="openAgent" data-session-id="${escapeAttr(session.id)}" title="Open agent terminal">${escapeHtml(session.id)}</button>`;
+}
+
+function renderAgentMessage(session: AgentSession): string {
+  const message = session.lastMessage || "No agent message found.";
+  const content = escapeHtml(truncateLines(message));
+  const title = escapeAttr(session.transcriptPath ? `Open transcript\n\n${session.lastMessage || ""}` : session.lastMessage || "");
+  if (!session.transcriptPath) {
+    return `<div class="message" title="${title}">${content}</div>`;
+  }
+
+  return `<button class="inline-action message" type="button" data-command="openTranscript" data-path="${escapeAttr(session.transcriptPath)}" title="${title}">${content}</button>`;
 }
 
 function renderSessionUsage(session: AgentSession): string {
@@ -959,9 +994,6 @@ function renderSessionUsage(session: AgentSession): string {
 }
 
 function renderActions(session: AgentSession): string {
-  const transcriptButton = session.transcriptPath
-    ? `<button class="secondary" type="button" data-command="openTranscript" data-path="${escapeAttr(session.transcriptPath)}">Transcript</button>`
-    : "";
   const reviewButton =
     session.status === "needs-approval"
       ? `<button type="button" data-command="approveSession" data-session-id="${escapeAttr(session.id)}">Approve</button><button type="button" data-command="alwaysApproveSession" data-session-id="${escapeAttr(session.id)}">Always Approve</button>`
@@ -974,7 +1006,7 @@ function renderActions(session: AgentSession): string {
     ? `<button class="secondary" type="button" data-command="compactSession" data-session-id="${escapeAttr(session.id)}">Compact</button>`
     : "";
 
-  return `<button class="secondary" type="button" data-command="openAgent" data-session-id="${escapeAttr(session.id)}">Open</button>${transcriptButton}${compactButton}${reviewButton}`;
+  return `${compactButton}${reviewButton}`;
 }
 
 function renderStatus(status: AgentStatus): string {
