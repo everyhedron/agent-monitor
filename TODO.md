@@ -1,20 +1,22 @@
 - [x] it gets stuck at "6 sessions · Refreshing..." forever. is it genuinly taking so much time? is something blocking it? what are the heavy operations? Can you confirm that it loops back to counting after it finishes refreshing?
 
 The webview now resets the countdown after refresh failures/timeouts instead of staying on `Refreshing...`. Scan timing is exposed in the header tooltip. Current smoke scan: total 2677ms, index 14ms, transcripts 2561ms, process check 85ms, so transcript parsing is the heavy operation.
+- [x] what error was it omitting? if there are errors we should actively print to the vscode output section for this app, which i assume is the console.log, instead of silently swallowing.
 
-- [x] when i checked back at a later time, the weekly and 5hour limits bar have disappeared. can you check that they dont depend on any session being actively running? they should always be present, possibly referencing the latest token usage message across the sessions. ![alt text](image.png)
-
-The top usage bars now use the latest available `rate_limits.primary` and `rate_limits.secondary` from transcript `token_count` events, independent of whether a session is currently running. If a token event exists but one window is missing, that window remains visible as unavailable instead of disappearing.
-- [x] add an approve button and always approve buttons on the needs approval notification, as well as change the "Reviewed" button on the page to the two buttons. which will send a y or p to that terminal respectively. for anything that is running, we can hide the reviewed button. the notification for approval should also include this part of the message (reason and the command also the name of the agent session) "  Reason: Allow reinstalling the packaged Project Monitor extension through the VS Code server.
- 
-  $ code --install-extension /home/django/everyhedron/project-monitor/project-monitor-0.0.10.vsix
-  --force"
-- [x] the reviewed tag should to cleared for a project if it ever becomes running after one marked it as reviewed.
+Codex response: Added an `Agent Monitor` VS Code output channel and scan diagnostics for index, transcript, process-check, webview-message, and notifier-poll errors. Missing optional transcript folders stay quiet; malformed transcript/index lines are counted and logged instead of being silently swallowed.
 - [x] to submit the compact command automatically, it should be "/compact" and enter, instead of /compact\n, which will paste in an actual newline
-- [x] sometimes it still pops up a requires approval message after i have set something to alwasy approve. can you check for some example session histories in .codex, and see what the difference between an asking for approval than auto approved and an actually waiting for approval? maybe we can also find the settings file where the auto approvals are listed and compare?
+- [x] for the above item, it still doesnt work, did we actually try entering /compact and sending an enter key action? im still getting /compact with a trailing newline.
 
-Checked visible Codex config: `/home/django/.codex/config.toml` contains project trust settings, not per-command approval rules. Sampled transcript histories had 49 `require_escalated` calls and 0 without matching `function_call_output`. Pending approval detection is now stricter: an approval only counts as waiting if its unresolved call is newer than the latest user message, completion, and abort.
+Codex response: Replaced `Terminal.sendText("/compact", true)` with VS Code's terminal sequence command using `/compact\r`, which sends the command plus carriage-return Enter to the active shown terminal instead of asking `sendText` to append a newline.
+- [x] can you confirm that the last xx.x token is counted since the last user input, not just the very last agent action?
 
-- [x] it'd be also nice to see, if in the updated section, it shows how many tokens that last one used, how many percentage of 5h and of 7h it used (if available) so user has more understanding of their token management.
-- [x] for total tokens, use abreviated units such as 6k, 2m, 3g, etc. when hovering on that it will show exact number.
-- [x] if a session is open in terminals, also expose a compact button on the card, that should submit "/compact" to that terminal
+Codex response: It was previously using Codex's raw `last_token_usage`, which is the latest reported action/model call. The dashboard now computes `Last run` by diffing total token usage since the latest real user message and falls back to `last_token_usage` only when no baseline exists.
+- [x] after reload, maybe we have multiple panels so the page is opened and pined multiple times on each panel. or maybe we did not successfully detect there are already existing monitor page. effect is, when i reload, i get duplicated pages.
+
+Codex response: Dashboard attachment now enforces a single monitor panel. If startup open and restored webview panels race, the later duplicate panel is disposed and the existing panel is revealed.
+- [x] ![alt text](image-1.png) we should make the notification for needing approval more beautiful. such as in the beginning just say which agents needs approval, then another line the reason (could be truncated), then the raw command on another line.
+
+Codex response: Approval notifications now use separate lines: `Approval needed`, truncated `Reason`, and truncated `Command`, while keeping the monitor/open-agent/approve/always-approve actions.
+- [x] ![alt text](image-2.png) for agent finished notification, we should have just which agent finished, a truncated version of its last message. and info in terms of its usage for the last run. and for buttons, we dont want the mark reviewd. we want an open agent button.
+
+Codex response: Finished notifications now show the agent name, truncated last agent message, and last-run usage (`tokens`, `5h`, `7d`). Buttons are now `Open Monitor` and `Open Agent`; `Mark Reviewed` was removed.

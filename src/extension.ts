@@ -3,19 +3,21 @@ import { readConfig, type AgentMonitorConfig } from "./config";
 import { Dashboard, dashboardViewType } from "./dashboard";
 import { ReviewState } from "./reviewState";
 import { scanAgents } from "./scanner";
-import type { AgentSession } from "./types";
+import type { AgentScan, AgentSession } from "./types";
 
 let config: AgentMonitorConfig;
 
 export function activate(context: vscode.ExtensionContext): void {
   config = readConfig();
+  const output = vscode.window.createOutputChannel("Agent Monitor");
   const reviewState = new ReviewState(context);
-  const dashboard = new Dashboard(context, reviewState, () => config);
+  const dashboard = new Dashboard(context, reviewState, () => config, output);
   const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 89);
   statusBarItem.command = "agentMonitor.openDashboard";
-  const notifier = new DoneNotifier(reviewState, () => config, dashboard, statusBarItem);
+  const notifier = new DoneNotifier(reviewState, () => config, dashboard, statusBarItem, output);
 
   context.subscriptions.push(
+    output,
     dashboard,
     notifier,
     statusBarItem,
@@ -62,7 +64,8 @@ class DoneNotifier {
     private readonly reviewState: ReviewState,
     private readonly getConfig: () => AgentMonitorConfig,
     private readonly dashboard: Dashboard,
-    private readonly statusBarItem: vscode.StatusBarItem
+    private readonly statusBarItem: vscode.StatusBarItem,
+    private readonly output: vscode.OutputChannel
   ) {}
 
   start(): void {
@@ -88,17 +91,22 @@ class DoneNotifier {
     try {
       const cfg = this.getConfig();
       let scan = await scanAgents(cfg, this.reviewState.getReviewed());
+      this.logDiagnostics(scan);
       const runningReviewedIds = scan.sessions
         .filter((session) => session.status === "running" && session.reviewedAt)
         .map((session) => session.id);
       if (runningReviewedIds.length > 0) {
         await this.reviewState.markUnreviewed(runningReviewedIds);
         scan = await scanAgents(cfg, this.reviewState.getReviewed());
+        this.logDiagnostics(scan);
       }
       this.updateStatusBar(scan.sessions);
       if (cfg.notifyOnDone) {
         await this.notifyTransitions(scan.sessions);
       }
+    } catch (error) {
+      const messageText = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`[${new Date().toISOString()}] ERROR notifier poll failed: ${messageText}`);
     } finally {
       this.polling = false;
     }
@@ -178,24 +186,92 @@ class DoneNotifier {
 
     for (const session of completed) {
       const choice = await vscode.window.showInformationMessage(
-        `Agent finished: ${session.name}`,
+        doneNotificationText(session),
         "Open Monitor",
-        "Mark Reviewed"
+        "Open Agent"
       );
 
       if (choice === "Open Monitor") {
         this.dashboard.open();
       }
 
-      if (choice === "Mark Reviewed") {
-        await this.dashboard.markReviewed(session.id);
+      if (choice === "Open Agent") {
+        this.dashboard.openAgent(session.id);
       }
+    }
+  }
+
+  private logDiagnostics(scan: AgentScan): void {
+    if (scan.diagnostics.length === 0) {
+      return;
+    }
+
+    const stamp = new Date().toISOString();
+    for (const item of scan.diagnostics) {
+      this.output.appendLine(`[${stamp}] ${item.level.toUpperCase()} ${item.source}: ${item.message}`);
     }
   }
 }
 
 function approvalNotificationText(session: AgentSession): string {
-  const reason = session.approvalReason ? `\n\nReason: ${session.approvalReason}` : "";
-  const command = session.approvalCommand ? `\n\n$ ${session.approvalCommand}` : "";
-  return `Agent needs approval: ${session.name}${reason}${command}`;
+  const lines = [`Approval needed: ${session.name}`];
+  if (session.approvalReason) {
+    lines.push(`Reason: ${truncate(session.approvalReason, 160)}`);
+  }
+  if (session.approvalCommand) {
+    lines.push(`Command: ${truncate(session.approvalCommand, 220)}`);
+  }
+  return lines.join("\n");
+}
+
+function doneNotificationText(session: AgentSession): string {
+  const lines = [`Agent finished: ${session.name}`];
+  if (session.lastMessage) {
+    lines.push(truncate(session.lastMessage, 180));
+  }
+  const usage = formatRunUsage(session);
+  if (usage) {
+    lines.push(`Run usage: ${usage}`);
+  }
+  return lines.join("\n");
+}
+
+function formatRunUsage(session: AgentSession): string | undefined {
+  const usage = session.usage;
+  const tokens = usage?.lastUserTurnTokenUsage?.totalTokens ?? usage?.lastTokenUsage?.totalTokens;
+  const primary = usage?.lastPrimaryDeltaPercent;
+  const secondary = usage?.lastSecondaryDeltaPercent;
+  const parts = [
+    tokens !== undefined ? `${formatCompactNumber(tokens)} tokens` : "",
+    primary !== undefined ? `5h +${formatPercent(primary)}` : "",
+    secondary !== undefined ? `7d +${formatPercent(secondary)}` : ""
+  ].filter(Boolean);
+
+  return parts.length > 0 ? parts.join(" · ") : undefined;
+}
+
+function truncate(value: string, maxLength: number): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 1)}...` : normalized;
+}
+
+function formatCompactNumber(value: number): string {
+  const abs = Math.abs(value);
+  const units = [
+    { suffix: "g", value: 1_000_000_000 },
+    { suffix: "m", value: 1_000_000 },
+    { suffix: "k", value: 1_000 }
+  ];
+  const unit = units.find((item) => abs >= item.value);
+  if (!unit) {
+    return String(value);
+  }
+
+  const compact = value / unit.value;
+  const formatted = compact >= 100 ? compact.toFixed(0) : compact >= 10 ? compact.toFixed(1) : compact.toFixed(2);
+  return `${formatted.replace(/\.0+$|(\.\d*[1-9])0+$/, "$1")}${unit.suffix}`;
+}
+
+function formatPercent(value: number): string {
+  return value < 1 && value > 0 ? `${value.toFixed(1)}%` : `${Math.round(value)}%`;
 }

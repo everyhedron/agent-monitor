@@ -41,6 +41,7 @@ export type AgentUsage = {
   planType?: string;
   totalTokenUsage?: AgentTokenUsage;
   lastTokenUsage?: AgentTokenUsage;
+  lastUserTurnTokenUsage?: AgentTokenUsage;
   modelContextWindow?: number;
   lastPrimaryDeltaPercent?: number;
   lastSecondaryDeltaPercent?: number;
@@ -61,6 +62,7 @@ export type AgentScan = {
   summary: AgentSummary;
   usage?: AgentUsage;
   timings: AgentScanTimings;
+  diagnostics: AgentScanDiagnostic[];
 };
 
 export type AgentScanTimings = {
@@ -68,4 +70,10 @@ export type AgentScanTimings = {
   indexMs: number;
   transcriptsMs: number;
   processMs: number;
+};
+
+export type AgentScanDiagnostic = {
+  level: "warning" | "error";
+  source: string;
+  message: string;
 };

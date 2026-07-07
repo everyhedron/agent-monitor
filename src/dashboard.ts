@@ -25,7 +25,8 @@ export class Dashboard {
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly reviewState: ReviewState,
-    private getConfig: () => AgentMonitorConfig
+    private getConfig: () => AgentMonitorConfig,
+    private readonly output: vscode.OutputChannel
   ) {}
 
   open(pin = false): void {
@@ -61,6 +62,12 @@ export class Dashboard {
   }
 
   private attachPanel(panel: vscode.WebviewPanel): void {
+    if (this.panel && this.panel !== panel) {
+      panel.dispose();
+      this.panel.reveal(vscode.ViewColumn.One);
+      return;
+    }
+
     this.panel = panel;
 
     panel.onDidDispose(
@@ -101,12 +108,14 @@ export class Dashboard {
 
   private async doRefresh(): Promise<AgentScan> {
     let scan = await scanAgents(this.getConfig(), this.reviewState.getReviewed());
+    this.logDiagnostics(scan);
     const runningReviewedIds = scan.sessions
       .filter((session) => session.status === "running" && session.reviewedAt)
       .map((session) => session.id);
     if (runningReviewedIds.length > 0) {
       await this.reviewState.markUnreviewed(runningReviewedIds);
       scan = await scanAgents(this.getConfig(), this.reviewState.getReviewed());
+      this.logDiagnostics(scan);
     }
     this.lastScan = scan;
     if (this.panel) {
@@ -186,6 +195,7 @@ export class Dashboard {
       }
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`[${new Date().toISOString()}] Error handling webview message "${message.command ?? "unknown"}": ${messageText}`);
       this.panel?.webview.postMessage({ command: "refreshFailed", message: messageText });
       void vscode.window.showErrorMessage(`Agent Monitor: ${messageText}`);
     }
@@ -236,7 +246,7 @@ export class Dashboard {
     const existingTerminal = vscode.window.terminals.find((terminal) => terminal.name === terminalName);
     if (existingTerminal) {
       existingTerminal.show();
-      existingTerminal.sendText("/compact", true);
+      await vscode.commands.executeCommand("workbench.action.terminal.sendSequence", { text: "/compact\r" });
       return;
     }
 
@@ -248,6 +258,17 @@ export class Dashboard {
   private async pinPanel(): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 50));
     await vscode.commands.executeCommand("workbench.action.pinEditor");
+  }
+
+  private logDiagnostics(scan: AgentScan): void {
+    if (scan.diagnostics.length === 0) {
+      return;
+    }
+
+    const stamp = new Date().toISOString();
+    for (const item of scan.diagnostics) {
+      this.output.appendLine(`[${stamp}] ${item.level.toUpperCase()} ${item.source}: ${item.message}`);
+    }
   }
 }
 
@@ -907,7 +928,7 @@ function renderSessionUsage(session: AgentSession): string {
   }
 
   const totalTokens = usage.totalTokenUsage?.totalTokens;
-  const lastTokens = usage.lastTokenUsage?.totalTokens;
+  const lastTokens = usage.lastUserTurnTokenUsage?.totalTokens ?? usage.lastTokenUsage?.totalTokens;
   const contextTokens = usage.lastTokenUsage?.inputTokens;
   const contextWindow = usage.modelContextWindow;
   const contextPercent =
@@ -919,14 +940,19 @@ function renderSessionUsage(session: AgentSession): string {
       ? `${formatNumber(contextTokens)} / ${formatNumber(contextWindow)} tokens`
       : "Context window unavailable";
   const totalTitle = totalTokens !== undefined ? `${formatNumber(totalTokens)} total tokens` : "Total tokens unavailable";
-  const lastTitle = lastTokens !== undefined ? `${formatNumber(lastTokens)} tokens in latest turn` : "Latest turn tokens unavailable";
+  const lastTitle =
+    usage.lastUserTurnTokenUsage?.totalTokens !== undefined
+      ? `${formatNumber(usage.lastUserTurnTokenUsage.totalTokens)} tokens since latest user message`
+      : lastTokens !== undefined
+      ? `${formatNumber(lastTokens)} tokens in latest Codex-reported action`
+      : "Latest turn tokens unavailable";
   const primaryDelta = usage.lastPrimaryDeltaPercent !== undefined ? `5h +${formatPercent(usage.lastPrimaryDeltaPercent)}` : "";
   const secondaryDelta = usage.lastSecondaryDeltaPercent !== undefined ? `7d +${formatPercent(usage.lastSecondaryDeltaPercent)}` : "";
   const deltaText = [primaryDelta, secondaryDelta].filter(Boolean).join(" · ");
 
   return `<div class="session-usage">
     <div class="meta" title="${escapeAttr(totalTitle)}">Total ${totalTokens !== undefined ? escapeHtml(formatCompactNumber(totalTokens)) : "unknown"} tokens</div>
-    <div class="meta" title="${escapeAttr(lastTitle)}">Last ${lastTokens !== undefined ? escapeHtml(formatCompactNumber(lastTokens)) : "unknown"} tokens${deltaText ? ` · ${escapeHtml(deltaText)}` : ""}</div>
+    <div class="meta" title="${escapeAttr(lastTitle)}">Last run ${lastTokens !== undefined ? escapeHtml(formatCompactNumber(lastTokens)) : "unknown"} tokens${deltaText ? ` · ${escapeHtml(deltaText)}` : ""}</div>
     <div class="meta" title="${escapeAttr(contextTitle)}">Context ${contextPercent !== undefined ? `${Math.round(contextPercent)}%` : "unknown"}</div>
     <div class="usage-track" title="${escapeAttr(contextTitle)}"><div class="usage-fill" style="width: ${contextPercent ?? 0}%"></div></div>
   </div>`;

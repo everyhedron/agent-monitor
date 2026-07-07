@@ -4,7 +4,15 @@ import * as path from "path";
 import { promisify } from "util";
 import type { AgentMonitorConfig } from "./config";
 import type { ReviewMap } from "./reviewState";
-import type { AgentScan, AgentSession, AgentStatus, AgentSummary, AgentTokenUsage, AgentUsage } from "./types";
+import type {
+  AgentScan,
+  AgentScanDiagnostic,
+  AgentSession,
+  AgentStatus,
+  AgentSummary,
+  AgentTokenUsage,
+  AgentUsage
+} from "./types";
 
 const execFileAsync = promisify(execFile);
 
@@ -34,15 +42,16 @@ type TranscriptInfo = {
 };
 
 export async function scanAgents(config: AgentMonitorConfig, reviewed: ReviewMap): Promise<AgentScan> {
+  const diagnostics: AgentScanDiagnostic[] = [];
   const scanStartedAt = Date.now();
   const indexStartedAt = Date.now();
-  const index = await readSessionIndex(config.codexHome);
+  const index = await readSessionIndex(config.codexHome, diagnostics);
   const indexMs = Date.now() - indexStartedAt;
   const processStartedAt = Date.now();
-  const activeProcessCount = await countActiveCodexProcesses();
+  const activeProcessCount = await countActiveCodexProcesses(diagnostics);
   const processMs = Date.now() - processStartedAt;
   const transcriptStartedAt = Date.now();
-  const transcripts = await readAllTranscripts(config.codexHome);
+  const transcripts = await readAllTranscripts(config.codexHome, diagnostics);
   const transcriptsMs = Date.now() - transcriptStartedAt;
   const sessions = index.map((session) => buildAgentSession(session, config, reviewed, activeProcessCount, transcripts));
   const sortedSessions = sessions.sort((a, b) => b.updatedAtMs - a.updatedAtMs);
@@ -58,7 +67,8 @@ export async function scanAgents(config: AgentMonitorConfig, reviewed: ReviewMap
       indexMs,
       transcriptsMs,
       processMs
-    }
+    },
+    diagnostics
   };
 }
 
@@ -121,16 +131,18 @@ function deriveStatus(
   return reviewedAt ? "reviewed" : "done-review";
 }
 
-async function readSessionIndex(codexHome: string): Promise<IndexedSession[]> {
+async function readSessionIndex(codexHome: string, diagnostics: AgentScanDiagnostic[]): Promise<IndexedSession[]> {
   const indexPath = path.join(codexHome, "session_index.jsonl");
   let content = "";
   try {
     content = await fs.readFile(indexPath, "utf8");
-  } catch {
+  } catch (error) {
+    diagnostics.push(diagnostic("warning", indexPath, `Could not read session index: ${errorMessage(error)}`));
     return [];
   }
 
   const sessions = new Map<string, IndexedSession>();
+  let invalidLines = 0;
   for (const line of content.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed) {
@@ -143,18 +155,22 @@ async function readSessionIndex(codexHome: string): Promise<IndexedSession[]> {
         sessions.set(parsed.id, parsed);
       }
     } catch {
+      invalidLines += 1;
       continue;
     }
+  }
+  if (invalidLines > 0) {
+    diagnostics.push(diagnostic("warning", indexPath, `Skipped ${invalidLines} invalid session index line(s).`));
   }
 
   return [...sessions.values()];
 }
 
-async function readAllTranscripts(codexHome: string): Promise<Map<string, TranscriptInfo>> {
-  const activeFiles = await walkJsonl(path.join(codexHome, "sessions"));
-  const archivedFiles = await walkJsonl(path.join(codexHome, "archived_sessions"));
-  const activeInfos = await Promise.all(activeFiles.map((file) => readTranscriptInfo(file, false)));
-  const archivedInfos = await Promise.all(archivedFiles.map((file) => readTranscriptInfo(file, true)));
+async function readAllTranscripts(codexHome: string, diagnostics: AgentScanDiagnostic[]): Promise<Map<string, TranscriptInfo>> {
+  const activeFiles = await walkJsonl(path.join(codexHome, "sessions"), diagnostics);
+  const archivedFiles = await walkJsonl(path.join(codexHome, "archived_sessions"), diagnostics);
+  const activeInfos = await Promise.all(activeFiles.map((file) => readTranscriptInfo(file, false, diagnostics)));
+  const archivedInfos = await Promise.all(archivedFiles.map((file) => readTranscriptInfo(file, true, diagnostics)));
   const transcripts = new Map<string, TranscriptInfo>();
 
   for (const info of activeInfos) {
@@ -170,11 +186,14 @@ async function readAllTranscripts(codexHome: string): Promise<Map<string, Transc
   return transcripts;
 }
 
-async function walkJsonl(root: string): Promise<string[]> {
+async function walkJsonl(root: string, diagnostics: AgentScanDiagnostic[]): Promise<string[]> {
   let entries: import("fs").Dirent[];
   try {
     entries = await fs.readdir(root, { withFileTypes: true });
-  } catch {
+  } catch (error) {
+    if (!isMissingPathError(error)) {
+      diagnostics.push(diagnostic("warning", root, `Could not read transcript folder: ${errorMessage(error)}`));
+    }
     return [];
   }
 
@@ -182,7 +201,7 @@ async function walkJsonl(root: string): Promise<string[]> {
     entries.map(async (entry) => {
       const fullPath = path.join(root, entry.name);
       if (entry.isDirectory()) {
-        return walkJsonl(fullPath);
+        return walkJsonl(fullPath, diagnostics);
       }
       return entry.isFile() && entry.name.endsWith(".jsonl") ? [fullPath] : [];
     })
@@ -191,8 +210,26 @@ async function walkJsonl(root: string): Promise<string[]> {
   return nested.flat();
 }
 
-async function readTranscriptInfo(transcriptPath: string, archived: boolean): Promise<TranscriptInfo> {
-  const [stat, content] = await Promise.all([fs.stat(transcriptPath), fs.readFile(transcriptPath, "utf8")]);
+async function readTranscriptInfo(
+  transcriptPath: string,
+  archived: boolean,
+  diagnostics: AgentScanDiagnostic[]
+): Promise<TranscriptInfo> {
+  let stat: Awaited<ReturnType<typeof fs.stat>>;
+  let content: string;
+  try {
+    [stat, content] = await Promise.all([fs.stat(transcriptPath), fs.readFile(transcriptPath, "utf8")]);
+  } catch (error) {
+    diagnostics.push(diagnostic("error", transcriptPath, `Could not read transcript: ${errorMessage(error)}`));
+    return {
+      sessionId: parseSessionIdFromPath(transcriptPath),
+      path: transcriptPath,
+      mtimeMs: 0,
+      archived,
+      hasCompletion: false,
+      hasPendingApproval: false
+    };
+  }
   let sessionId = parseSessionIdFromPath(transcriptPath);
   let title: string | undefined;
   let lastUserMessage: string | undefined;
@@ -208,6 +245,8 @@ async function readTranscriptInfo(transcriptPath: string, archived: boolean): Pr
   let latestAbortMs = 0;
   let transcriptUsage: AgentUsage | undefined;
   let previousUsage: AgentUsage | undefined;
+  let userTurnBaselineUsage: AgentUsage | undefined;
+  let malformedLines = 0;
   const pendingApprovalCalls = new Map<string, number>();
 
   for (const line of content.split("\n")) {
@@ -250,6 +289,7 @@ async function readTranscriptInfo(transcriptPath: string, archived: boolean): Pr
       ) {
         latestUserAt = parsed.timestamp;
         latestUserMs = timestampMs;
+        userTurnBaselineUsage = previousUsage;
         const userMessage = extractUserMessage(parsed.payload);
         if (userMessage) {
           lastUserMessage = userMessage;
@@ -291,15 +331,21 @@ async function readTranscriptInfo(transcriptPath: string, archived: boolean): Pr
       if (parsed.type === "event_msg" && parsed.payload?.type === "token_count") {
         const usage = parseUsage(parsed.timestamp, parsed.payload);
         if (usage) {
-          usage.lastPrimaryDeltaPercent = usageDelta(usage.primary?.usedPercent, previousUsage?.primary?.usedPercent);
-          usage.lastSecondaryDeltaPercent = usageDelta(usage.secondary?.usedPercent, previousUsage?.secondary?.usedPercent);
+          usage.lastUserTurnTokenUsage =
+            diffTokenUsage(usage.totalTokenUsage, userTurnBaselineUsage?.totalTokenUsage) ?? usage.lastTokenUsage;
+          usage.lastPrimaryDeltaPercent = usageDelta(usage.primary?.usedPercent, userTurnBaselineUsage?.primary?.usedPercent);
+          usage.lastSecondaryDeltaPercent = usageDelta(usage.secondary?.usedPercent, userTurnBaselineUsage?.secondary?.usedPercent);
           previousUsage = usage;
           transcriptUsage = usage;
         }
       }
     } catch {
+      malformedLines += 1;
       continue;
     }
+  }
+  if (malformedLines > 0) {
+    diagnostics.push(diagnostic("warning", transcriptPath, `Skipped ${malformedLines} malformed transcript line(s).`));
   }
 
   const hasCompletion = lastCompletionMs > 0 && lastCompletionMs >= latestUserMs && lastCompletionMs >= latestAbortMs;
@@ -331,6 +377,30 @@ async function readTranscriptInfo(transcriptPath: string, archived: boolean): Pr
 }
 
 function usageDelta(current: number | undefined, previous: number | undefined): number | undefined {
+  if (current === undefined || previous === undefined) {
+    return undefined;
+  }
+
+  return Math.max(0, current - previous);
+}
+
+function diffTokenUsage(current: AgentTokenUsage | undefined, previous: AgentTokenUsage | undefined): AgentTokenUsage | undefined {
+  if (!current || !previous) {
+    return undefined;
+  }
+
+  const diff = {
+    inputTokens: tokenDelta(current.inputTokens, previous.inputTokens),
+    cachedInputTokens: tokenDelta(current.cachedInputTokens, previous.cachedInputTokens),
+    outputTokens: tokenDelta(current.outputTokens, previous.outputTokens),
+    reasoningOutputTokens: tokenDelta(current.reasoningOutputTokens, previous.reasoningOutputTokens),
+    totalTokens: tokenDelta(current.totalTokens, previous.totalTokens)
+  };
+
+  return Object.values(diff).some((item) => item !== undefined) ? diff : undefined;
+}
+
+function tokenDelta(current: number | undefined, previous: number | undefined): number | undefined {
   if (current === undefined || previous === undefined) {
     return undefined;
   }
@@ -479,7 +549,7 @@ function parseSessionIdFromPath(transcriptPath: string): string {
   return match?.[1] ?? transcriptPath;
 }
 
-async function countActiveCodexProcesses(): Promise<number> {
+async function countActiveCodexProcesses(diagnostics: AgentScanDiagnostic[]): Promise<number> {
   try {
     const { stdout } = await execFileAsync("ps", ["-eo", "pid=,comm=,args="], {
       timeout: 2500,
@@ -490,9 +560,22 @@ async function countActiveCodexProcesses(): Promise<number> {
       .split("\n")
       .filter((line) => /\bcodex\b/i.test(line))
       .filter((line) => !/agent-monitor|extensionHost/i.test(line)).length;
-  } catch {
+  } catch (error) {
+    diagnostics.push(diagnostic("warning", "process check", `Could not count Codex processes: ${errorMessage(error)}`));
     return 0;
   }
+}
+
+function diagnostic(level: AgentScanDiagnostic["level"], source: string, message: string): AgentScanDiagnostic {
+  return { level, source, message };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isMissingPathError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 }
 
 function summarize(sessions: AgentSession[]): AgentSummary {
