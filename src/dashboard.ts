@@ -160,6 +160,11 @@ export class Dashboard {
         return;
       }
 
+      if (message.command === "compactSession" && message.sessionId) {
+        await this.sendCompact(message.sessionId);
+        return;
+      }
+
       if (message.command === "openTranscript" && message.path) {
         await vscode.window.showTextDocument(vscode.Uri.file(message.path), { preview: false });
         return;
@@ -181,6 +186,7 @@ export class Dashboard {
       }
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
+      this.panel?.webview.postMessage({ command: "refreshFailed", message: messageText });
       void vscode.window.showErrorMessage(`Agent Monitor: ${messageText}`);
     }
   }
@@ -224,13 +230,13 @@ export class Dashboard {
     await this.refresh();
   }
 
-  private async sendCompact(sessionId: string): Promise<void> {
+  async sendCompact(sessionId: string): Promise<void> {
     const session = this.lastScan?.sessions.find((session) => session.id === sessionId);
     const terminalName = terminalNameForSession(session?.name);
     const existingTerminal = vscode.window.terminals.find((terminal) => terminal.name === terminalName);
     if (existingTerminal) {
       existingTerminal.show();
-      existingTerminal.sendText("/compact");
+      existingTerminal.sendText("/compact", true);
       return;
     }
 
@@ -246,10 +252,15 @@ export class Dashboard {
 }
 
 function renderDashboard(scan: AgentScan, config: AgentMonitorConfig): string {
-  const cards = scan.sessions.map(renderSessionCard).join("");
-  const rows = scan.sessions.map(renderSessionRow).join("");
+  const openTerminalNames = new Set(vscode.window.terminals.map((terminal) => terminal.name));
+  const sessions = scan.sessions.map((session) => ({
+    ...session,
+    isOpenInTerminal: openTerminalNames.has(terminalNameForSession(session.name))
+  }));
+  const cards = sessions.map(renderSessionCard).join("");
+  const rows = sessions.map(renderSessionRow).join("");
   const empty = scan.sessions.length === 0 ? `<div class="empty">No Codex chats found in ${escapeHtml(scan.codexHome)}.</div>` : "";
-  const summaryTitle = summaryTooltip(scan.summary);
+  const summaryTitle = summaryTooltip(scan.summary, scan.timings);
   const refreshSeconds = Math.round(config.refreshIntervalMs / 1000);
 
   return `<!doctype html>
@@ -697,6 +708,7 @@ function renderDashboard(scan: AgentScan, config: AgentMonitorConfig): string {
     const refreshSeconds = ${refreshSeconds};
     let countdown = refreshSeconds;
     let refreshing = false;
+    let refreshTimeout;
 
     function persistState(extra = {}) {
       vscode.setState({
@@ -753,7 +765,22 @@ function renderDashboard(scan: AgentScan, config: AgentMonitorConfig): string {
       refreshing = true;
       setRefreshStatus();
       vscode.postMessage({ command: "refresh" });
+      clearTimeout(refreshTimeout);
+      refreshTimeout = setTimeout(() => {
+        refreshing = false;
+        countdown = refreshSeconds;
+        setRefreshStatus();
+      }, Math.max(10000, refreshSeconds * 3000));
     }
+
+    window.addEventListener("message", (event) => {
+      if (event.data?.command === "refreshFailed") {
+        clearTimeout(refreshTimeout);
+        refreshing = false;
+        countdown = refreshSeconds;
+        setRefreshStatus();
+      }
+    });
 
     showMode(persistedState.viewMode || "cards");
     applyStatusFilter();
@@ -880,6 +907,7 @@ function renderSessionUsage(session: AgentSession): string {
   }
 
   const totalTokens = usage.totalTokenUsage?.totalTokens;
+  const lastTokens = usage.lastTokenUsage?.totalTokens;
   const contextTokens = usage.lastTokenUsage?.inputTokens;
   const contextWindow = usage.modelContextWindow;
   const contextPercent =
@@ -890,9 +918,15 @@ function renderSessionUsage(session: AgentSession): string {
     contextTokens !== undefined && contextWindow !== undefined
       ? `${formatNumber(contextTokens)} / ${formatNumber(contextWindow)} tokens`
       : "Context window unavailable";
+  const totalTitle = totalTokens !== undefined ? `${formatNumber(totalTokens)} total tokens` : "Total tokens unavailable";
+  const lastTitle = lastTokens !== undefined ? `${formatNumber(lastTokens)} tokens in latest turn` : "Latest turn tokens unavailable";
+  const primaryDelta = usage.lastPrimaryDeltaPercent !== undefined ? `5h +${formatPercent(usage.lastPrimaryDeltaPercent)}` : "";
+  const secondaryDelta = usage.lastSecondaryDeltaPercent !== undefined ? `7d +${formatPercent(usage.lastSecondaryDeltaPercent)}` : "";
+  const deltaText = [primaryDelta, secondaryDelta].filter(Boolean).join(" · ");
 
   return `<div class="session-usage">
-    <div class="meta">Total ${totalTokens !== undefined ? escapeHtml(formatNumber(totalTokens)) : "unknown"} tokens</div>
+    <div class="meta" title="${escapeAttr(totalTitle)}">Total ${totalTokens !== undefined ? escapeHtml(formatCompactNumber(totalTokens)) : "unknown"} tokens</div>
+    <div class="meta" title="${escapeAttr(lastTitle)}">Last ${lastTokens !== undefined ? escapeHtml(formatCompactNumber(lastTokens)) : "unknown"} tokens${deltaText ? ` · ${escapeHtml(deltaText)}` : ""}</div>
     <div class="meta" title="${escapeAttr(contextTitle)}">Context ${contextPercent !== undefined ? `${Math.round(contextPercent)}%` : "unknown"}</div>
     <div class="usage-track" title="${escapeAttr(contextTitle)}"><div class="usage-fill" style="width: ${contextPercent ?? 0}%"></div></div>
   </div>`;
@@ -910,8 +944,11 @@ function renderActions(session: AgentSession): string {
       : session.status === "reviewed"
       ? `<button class="secondary" type="button" data-command="markUnreviewed" data-session-id="${escapeAttr(session.id)}">Unreview</button>`
       : `<button type="button" data-command="markReviewed" data-session-id="${escapeAttr(session.id)}">Reviewed</button>`;
+  const compactButton = session.isOpenInTerminal
+    ? `<button class="secondary" type="button" data-command="compactSession" data-session-id="${escapeAttr(session.id)}">Compact</button>`
+    : "";
 
-  return `<button class="secondary" type="button" data-command="openAgent" data-session-id="${escapeAttr(session.id)}">Open</button>${transcriptButton}${reviewButton}`;
+  return `<button class="secondary" type="button" data-command="openAgent" data-session-id="${escapeAttr(session.id)}">Open</button>${transcriptButton}${compactButton}${reviewButton}`;
 }
 
 function renderStatus(status: AgentStatus): string {
@@ -945,14 +982,17 @@ function renderUsage(scan: AgentScan): string {
   }
 
   return `<section class="usage" title="Usage captured ${escapeAttr(formatDate(scan.usage.capturedAt))}">
-    ${scan.usage.primary ? renderUsageWindow("5h usage", scan.usage.primary) : ""}
-    ${scan.usage.secondary ? renderUsageWindow("7d usage", scan.usage.secondary) : ""}
+    ${renderUsageWindow("5h usage", scan.usage.primary)}
+    ${renderUsageWindow("7d usage", scan.usage.secondary)}
   </section>`;
 }
 
 function renderUsageWindow(label: string, usage: NonNullable<AgentScan["usage"]>["primary"]): string {
   if (!usage) {
-    return "";
+    return `<div class="usage-window">
+      <div class="usage-label"><strong>${escapeHtml(label)}</strong><span>unavailable</span></div>
+      <div class="usage-track"><div class="usage-fill" style="width: 0%"></div></div>
+    </div>`;
   }
 
   return `<div class="usage-window">
@@ -961,15 +1001,20 @@ function renderUsageWindow(label: string, usage: NonNullable<AgentScan["usage"]>
   </div>`;
 }
 
-function summaryTooltip(summary: AgentScan["summary"]): string {
+function summaryTooltip(summary: AgentScan["summary"], timings?: AgentScan["timings"]): string {
   return [
     `Running: ${summary.running}`,
     `Needs approval: ${summary.needsApproval}`,
     `Done: ${summary.doneReview}`,
     `Reviewed: ${summary.reviewed}`,
     `Archived: ${summary.archived}`,
-    `Unknown: ${summary.unknown}`
-  ].join("\n");
+    `Unknown: ${summary.unknown}`,
+    timings
+      ? `Scan: ${timings.totalMs}ms (index ${timings.indexMs}ms, transcripts ${timings.transcriptsMs}ms, processes ${timings.processMs}ms)`
+      : ""
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function truncate(value: string, maxLength: number): string {
@@ -1000,6 +1045,27 @@ function formatUnixSeconds(value: number | undefined): string {
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat().format(value);
+}
+
+function formatCompactNumber(value: number): string {
+  const abs = Math.abs(value);
+  const units = [
+    { suffix: "g", value: 1_000_000_000 },
+    { suffix: "m", value: 1_000_000 },
+    { suffix: "k", value: 1_000 }
+  ];
+  const unit = units.find((item) => abs >= item.value);
+  if (!unit) {
+    return String(value);
+  }
+
+  const compact = value / unit.value;
+  const formatted = compact >= 100 ? compact.toFixed(0) : compact >= 10 ? compact.toFixed(1) : compact.toFixed(2);
+  return `${formatted.replace(/\.0+$|(\.\d*[1-9])0+$/, "$1")}${unit.suffix}`;
+}
+
+function formatPercent(value: number): string {
+  return value < 1 && value > 0 ? `${value.toFixed(1)}%` : `${Math.round(value)}%`;
 }
 
 function escapeHtml(value: string): string {

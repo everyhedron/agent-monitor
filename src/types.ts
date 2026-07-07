@@ -15,6 +15,7 @@ export type AgentSession = {
   lastCompletionAt?: string;
   reviewedAt?: string;
   usage?: AgentUsage;
+  isOpenInTerminal?: boolean;
 };
 
 export type AgentSummary = {
@@ -41,6 +42,8 @@ export type AgentUsage = {
   totalTokenUsage?: AgentTokenUsage;
   lastTokenUsage?: AgentTokenUsage;
   modelContextWindow?: number;
+  lastPrimaryDeltaPercent?: number;
+  lastSecondaryDeltaPercent?: number;
 };
 
 export type AgentTokenUsage = {
@@ -57,4 +60,12 @@ export type AgentScan = {
   sessions: AgentSession[];
   summary: AgentSummary;
   usage?: AgentUsage;
+  timings: AgentScanTimings;
+};
+
+export type AgentScanTimings = {
+  totalMs: number;
+  indexMs: number;
+  transcriptsMs: number;
+  processMs: number;
 };

@@ -1,26 +1,20 @@
-- [x] it gets stuck at 0s forever "6 sessions · Refreshing in 0s" check the logic to see why its doing that. if the refresh genuinly takes so long, it should be changed to "Refreshing..." while it is actually refreshing, and keep restart the counter after it refreshes.
-- [x] on the top we also want to have a usage traking the 5h usage, reset times, and 7 day limit. is this an information that is available in each session files? if so, write below what information we have available, i will choose which ones to include for each card. if information are available, implement the total 5h and 7d usage bar with reset times. if not, write below your suggestion. 
+- [x] it gets stuck at "6 sessions · Refreshing..." forever. is it genuinly taking so much time? is something blocking it? what are the heavy operations? Can you confirm that it loops back to counting after it finishes refreshing?
 
-Usage information available:
+The webview now resets the countdown after refresh failures/timeouts instead of staying on `Refreshing...`. Scan timing is exposed in the header tooltip. Current smoke scan: total 2677ms, index 14ms, transcripts 2561ms, process check 85ms, so transcript parsing is the heavy operation.
 
-Codex session transcripts include `event_msg` entries where `payload.type` is `token_count`. The useful fields are:
+- [x] when i checked back at a later time, the weekly and 5hour limits bar have disappeared. can you check that they dont depend on any session being actively running? they should always be present, possibly referencing the latest token usage message across the sessions. ![alt text](image.png)
 
-- `payload.info.total_token_usage`: cumulative input, cached input, output, reasoning output, and total token counts for that transcript.
-- `payload.info.last_token_usage`: token counts for the last model turn.
-- `payload.info.model_context_window`: model context window size.
-- `payload.rate_limits.primary`: current 5h window usage, with `used_percent`, `window_minutes: 300`, and `resets_at`.
-- `payload.rate_limits.secondary`: current 7d window usage, with `used_percent`, `window_minutes: 10080`, and `resets_at`.
-- `payload.rate_limits.plan_type`: current plan label, for example `plus`.
-
-Agent Monitor now uses the latest transcript `token_count` event to render total 5h and 7d usage bars with reset times.
-
-- [x] we would also like a per session cumulative usage, and the current context window. total token usage is a number, while context window is a bar relative to the auto compaction limit, when hovering it will show the actual number.
-
-Per-session usage now uses the latest `token_count` entry in that session transcript. It displays cumulative `total_token_usage.total_tokens`, plus a context bar using latest turn `last_token_usage.input_tokens / model_context_window`. Hovering the context bar shows the raw token count and context window.
+The top usage bars now use the latest available `rate_limits.primary` and `rate_limits.secondary` from transcript `token_count` events, independent of whether a session is currently running. If a token event exists but one window is missing, that window remains visible as unavailable instead of disappearing.
 - [x] add an approve button and always approve buttons on the needs approval notification, as well as change the "Reviewed" button on the page to the two buttons. which will send a y or p to that terminal respectively. for anything that is running, we can hide the reviewed button. the notification for approval should also include this part of the message (reason and the command also the name of the agent session) "  Reason: Allow reinstalling the packaged Project Monitor extension through the VS Code server.
  
   $ code --install-extension /home/django/everyhedron/project-monitor/project-monitor-0.0.10.vsix
   --force"
 - [x] the reviewed tag should to cleared for a project if it ever becomes running after one marked it as reviewed.
-- [x] add a auto compact on review checkbox at the top, will will submit a "/compact" message to the corresponding terminal, if auto compact has not been sent due to the terminal already closed, open the agent terminal and copy the /compact command to clipboard, and pop up a notification saying auto compact failed, please paste command to terminal manually.
-- [x] you can omit the Total card on top, the default without selecting anything would be total.
+- [x] to submit the compact command automatically, it should be "/compact" and enter, instead of /compact\n, which will paste in an actual newline
+- [x] sometimes it still pops up a requires approval message after i have set something to alwasy approve. can you check for some example session histories in .codex, and see what the difference between an asking for approval than auto approved and an actually waiting for approval? maybe we can also find the settings file where the auto approvals are listed and compare?
+
+Checked visible Codex config: `/home/django/.codex/config.toml` contains project trust settings, not per-command approval rules. Sampled transcript histories had 49 `require_escalated` calls and 0 without matching `function_call_output`. Pending approval detection is now stricter: an approval only counts as waiting if its unresolved call is newer than the latest user message, completion, and abort.
+
+- [x] it'd be also nice to see, if in the updated section, it shows how many tokens that last one used, how many percentage of 5h and of 7h it used (if available) so user has more understanding of their token management.
+- [x] for total tokens, use abreviated units such as 6k, 2m, 3g, etc. when hovering on that it will show exact number.
+- [x] if a session is open in terminals, also expose a compact button on the card, that should submit "/compact" to that terminal

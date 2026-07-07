@@ -34,9 +34,16 @@ type TranscriptInfo = {
 };
 
 export async function scanAgents(config: AgentMonitorConfig, reviewed: ReviewMap): Promise<AgentScan> {
+  const scanStartedAt = Date.now();
+  const indexStartedAt = Date.now();
   const index = await readSessionIndex(config.codexHome);
-  const transcripts = await readAllTranscripts(config.codexHome);
+  const indexMs = Date.now() - indexStartedAt;
+  const processStartedAt = Date.now();
   const activeProcessCount = await countActiveCodexProcesses();
+  const processMs = Date.now() - processStartedAt;
+  const transcriptStartedAt = Date.now();
+  const transcripts = await readAllTranscripts(config.codexHome);
+  const transcriptsMs = Date.now() - transcriptStartedAt;
   const sessions = index.map((session) => buildAgentSession(session, config, reviewed, activeProcessCount, transcripts));
   const sortedSessions = sessions.sort((a, b) => b.updatedAtMs - a.updatedAtMs);
 
@@ -45,7 +52,13 @@ export async function scanAgents(config: AgentMonitorConfig, reviewed: ReviewMap
     scannedAt: new Date().toISOString(),
     sessions: sortedSessions,
     summary: summarize(sortedSessions),
-    usage: latestUsage(transcripts)
+    usage: latestUsage(transcripts),
+    timings: {
+      totalMs: Date.now() - scanStartedAt,
+      indexMs,
+      transcriptsMs,
+      processMs
+    }
   };
 }
 
@@ -194,6 +207,7 @@ async function readTranscriptInfo(transcriptPath: string, archived: boolean): Pr
   let latestUserMs = 0;
   let latestAbortMs = 0;
   let transcriptUsage: AgentUsage | undefined;
+  let previousUsage: AgentUsage | undefined;
   const pendingApprovalCalls = new Map<string, number>();
 
   for (const line of content.split("\n")) {
@@ -277,6 +291,9 @@ async function readTranscriptInfo(transcriptPath: string, archived: boolean): Pr
       if (parsed.type === "event_msg" && parsed.payload?.type === "token_count") {
         const usage = parseUsage(parsed.timestamp, parsed.payload);
         if (usage) {
+          usage.lastPrimaryDeltaPercent = usageDelta(usage.primary?.usedPercent, previousUsage?.primary?.usedPercent);
+          usage.lastSecondaryDeltaPercent = usageDelta(usage.secondary?.usedPercent, previousUsage?.secondary?.usedPercent);
+          previousUsage = usage;
           transcriptUsage = usage;
         }
       }
@@ -287,7 +304,11 @@ async function readTranscriptInfo(transcriptPath: string, archived: boolean): Pr
 
   const hasCompletion = lastCompletionMs > 0 && lastCompletionMs >= latestUserMs && lastCompletionMs >= latestAbortMs;
   const latestPendingApprovalMs = Math.max(0, ...pendingApprovalCalls.values());
-  const hasPendingApproval = latestPendingApprovalMs > 0 && latestPendingApprovalMs >= lastCompletionMs && latestPendingApprovalMs >= latestAbortMs;
+  const hasPendingApproval =
+    latestPendingApprovalMs > 0 &&
+    latestPendingApprovalMs >= latestUserMs &&
+    latestPendingApprovalMs >= lastCompletionMs &&
+    latestPendingApprovalMs >= latestAbortMs;
 
   return {
     sessionId,
@@ -307,6 +328,14 @@ async function readTranscriptInfo(transcriptPath: string, archived: boolean): Pr
     latestUserAt,
     latestAbortAt
   };
+}
+
+function usageDelta(current: number | undefined, previous: number | undefined): number | undefined {
+  if (current === undefined || previous === undefined) {
+    return undefined;
+  }
+
+  return Math.max(0, current - previous);
 }
 
 function parseUsage(timestamp: string | undefined, payload: { rate_limits?: unknown; info?: unknown }): AgentUsage | undefined {
@@ -479,10 +508,21 @@ function summarize(sessions: AgentSession[]): AgentSummary {
 }
 
 function latestUsage(transcripts: Map<string, TranscriptInfo>): AgentUsage | undefined {
-  return [...transcripts.values()]
+  const usages = [...transcripts.values()]
     .map((transcript) => transcript.usage)
     .filter((usage): usage is AgentUsage => usage !== undefined)
-    .sort((a, b) => (parseTime(b.capturedAt) ?? 0) - (parseTime(a.capturedAt) ?? 0))[0];
+    .sort((a, b) => (parseTime(b.capturedAt) ?? 0) - (parseTime(a.capturedAt) ?? 0));
+
+  const latest = usages[0];
+  if (!latest) {
+    return undefined;
+  }
+
+  return {
+    ...latest,
+    primary: latest.primary ?? usages.find((usage) => usage.primary)?.primary,
+    secondary: latest.secondary ?? usages.find((usage) => usage.secondary)?.secondary
+  };
 }
 
 function isRecent(timeMs: number, seconds: number): boolean {
