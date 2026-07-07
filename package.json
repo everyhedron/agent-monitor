@@ -1,0 +1,87 @@
+{
+  "name": "agent-monitor",
+  "displayName": "Agent Monitor",
+  "description": "VS Code dashboard for local Codex chats and review status.",
+  "version": "0.0.1",
+  "publisher": "everyhedron",
+  "license": "MIT",
+  "files": [
+    "out/**",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onWebviewPanel:agentMonitor.dashboard",
+    "onCommand:agentMonitor.openDashboard",
+    "onCommand:agentMonitor.refresh"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "agentMonitor.openDashboard",
+        "title": "Agent Monitor: Open Dashboard"
+      },
+      {
+        "command": "agentMonitor.refresh",
+        "title": "Agent Monitor: Refresh"
+      }
+    ],
+    "configuration": {
+      "title": "Agent Monitor",
+      "properties": {
+        "agentMonitor.codexHome": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the Codex home folder. Leave empty to use ~/.codex."
+        },
+        "agentMonitor.refreshIntervalMs": {
+          "type": "number",
+          "default": 5000,
+          "minimum": 1000,
+          "description": "Dashboard and notification polling interval in milliseconds."
+        },
+        "agentMonitor.runningActivitySeconds": {
+          "type": "number",
+          "default": 90,
+          "minimum": 10,
+          "description": "A session without a completion marker is considered running if its transcript changed within this many seconds."
+        },
+        "agentMonitor.notifyOnDone": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a VS Code notification when a running chat becomes done."
+        },
+        "agentMonitor.openOnStartup": {
+          "type": "boolean",
+          "default": false,
+          "description": "Open the Agent Monitor dashboard when VS Code starts."
+        },
+        "agentMonitor.pinOnStartup": {
+          "type": "boolean",
+          "default": false,
+          "description": "Pin the Agent Monitor dashboard tab when it opens on VS Code startup."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package --allow-missing-repository --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.2.1",
+    "typescript": "^5.5.4"
+  }
+}
