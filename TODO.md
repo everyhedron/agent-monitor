@@ -24,4 +24,7 @@ Codex session transcripts include `event_msg` entries where `payload.type` is `t
 
 Agent Monitor now uses the latest transcript `token_count` event to render total 5h and 7d usage bars with reset times.
 - [x] Similar to project monitor, we want on the button status bar an icon with a x/y number. x is number of items needing review or needing approval, y is the total number of chats. when hovering it will display count for each status. and clicking will open or focus the page.
-- [ ] 
+- [x] add an approve button and always approve buttons on the needs approval notification, as well as change the "Reviewed" button on the page to the two buttons. which will send a y or p to that terminal respectively. for anything that is running, we can hide the reviewed button. the notification for approval should also include this part of the message (reason and the command also the name of the agent session) "  Reason: Allow reinstalling the packaged Project Monitor extension through the VS Code server.
+ 
+  $ code --install-extension /home/django/everyhedron/project-monitor/project-monitor-0.0.10.vsix
+  --force"

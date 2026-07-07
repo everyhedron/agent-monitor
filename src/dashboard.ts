@@ -129,6 +129,16 @@ export class Dashboard {
         return;
       }
 
+      if (message.command === "approveSession" && message.sessionId) {
+        this.sendApproval(message.sessionId, "y");
+        return;
+      }
+
+      if (message.command === "alwaysApproveSession" && message.sessionId) {
+        this.sendApproval(message.sessionId, "p");
+        return;
+      }
+
       if (message.command === "openTranscript" && message.path) {
         await vscode.window.showTextDocument(vscode.Uri.file(message.path), { preview: false });
         return;
@@ -170,6 +180,20 @@ export class Dashboard {
     });
     terminal.show();
     terminal.sendText(`codex resume ${sessionId}`);
+  }
+
+  sendApproval(sessionId: string, approval: "y" | "p"): void {
+    const session = this.lastScan?.sessions.find((session) => session.id === sessionId);
+    const terminalName = terminalNameForSession(session?.name);
+    const existingTerminal = vscode.window.terminals.find((terminal) => terminal.name === terminalName);
+    if (!existingTerminal) {
+      this.openAgent(sessionId);
+      void vscode.window.showWarningMessage(`Agent Monitor opened ${terminalName}. Send approval again once the prompt is visible.`);
+      return;
+    }
+
+    existingTerminal.show();
+    existingTerminal.sendText(approval);
   }
 
   private async pinPanel(): Promise<void> {
@@ -760,7 +784,9 @@ function renderActions(session: AgentSession): string {
     ? `<button class="secondary" type="button" data-command="openTranscript" data-path="${escapeAttr(session.transcriptPath)}">Transcript</button>`
     : "";
   const reviewButton =
-    session.status === "archived"
+    session.status === "needs-approval"
+      ? `<button type="button" data-command="approveSession" data-session-id="${escapeAttr(session.id)}">Approve</button><button type="button" data-command="alwaysApproveSession" data-session-id="${escapeAttr(session.id)}">Always Approve</button>`
+      : session.status === "archived" || session.status === "running"
       ? ""
       : session.status === "reviewed"
       ? `<button class="secondary" type="button" data-command="markUnreviewed" data-session-id="${escapeAttr(session.id)}">Unreview</button>`

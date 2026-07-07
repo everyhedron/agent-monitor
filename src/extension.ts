@@ -141,9 +141,11 @@ class DoneNotifier {
       }
       if (this.initialized && previousStatus !== "needs-approval" && session.status === "needs-approval") {
         const choice = await vscode.window.showWarningMessage(
-          `Agent needs approval: ${session.name}`,
+          approvalNotificationText(session),
           "Open Monitor",
-          "Open Agent"
+          "Open Agent",
+          "Approve",
+          "Always Approve"
         );
 
         if (choice === "Open Monitor") {
@@ -152,6 +154,14 @@ class DoneNotifier {
 
         if (choice === "Open Agent") {
           this.dashboard.openAgent(session.id);
+        }
+
+        if (choice === "Approve") {
+          this.dashboard.sendApproval(session.id, "y");
+        }
+
+        if (choice === "Always Approve") {
+          this.dashboard.sendApproval(session.id, "p");
         }
       }
     }
@@ -176,4 +186,10 @@ class DoneNotifier {
       }
     }
   }
+}
+
+function approvalNotificationText(session: AgentSession): string {
+  const reason = session.approvalReason ? `\n\nReason: ${session.approvalReason}` : "";
+  const command = session.approvalCommand ? `\n\n$ ${session.approvalCommand}` : "";
+  return `Agent needs approval: ${session.name}${reason}${command}`;
 }

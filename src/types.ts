@@ -10,6 +10,8 @@ export type AgentSession = {
   transcriptMtimeMs?: number;
   lastUserMessage?: string;
   lastMessage?: string;
+  approvalReason?: string;
+  approvalCommand?: string;
   lastCompletionAt?: string;
   reviewedAt?: string;
 };

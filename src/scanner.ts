@@ -22,6 +22,8 @@ type TranscriptInfo = {
   title?: string;
   lastUserMessage?: string;
   lastMessage?: string;
+  approvalReason?: string;
+  approvalCommand?: string;
   lastCompletionAt?: string;
   pendingApprovalAt?: string;
   hasCompletion: boolean;
@@ -69,6 +71,8 @@ function buildAgentSession(
     transcriptMtimeMs: transcript?.mtimeMs,
     lastUserMessage: transcript?.lastUserMessage,
     lastMessage: transcript?.lastMessage,
+    approvalReason: transcript?.approvalReason,
+    approvalCommand: transcript?.approvalCommand,
     lastCompletionAt: transcript?.lastCompletionAt,
     reviewedAt
   };
@@ -179,6 +183,8 @@ async function readTranscriptInfo(transcriptPath: string, archived: boolean): Pr
   let title: string | undefined;
   let lastUserMessage: string | undefined;
   let lastMessage: string | undefined;
+  let approvalReason: string | undefined;
+  let approvalCommand: string | undefined;
   let lastCompletionAt: string | undefined;
   let pendingApprovalAt: string | undefined;
   let latestUserAt: string | undefined;
@@ -256,7 +262,9 @@ async function readTranscriptInfo(transcriptPath: string, archived: boolean): Pr
         if (permissionRequest && parsed.payload.call_id) {
           pendingApprovalCalls.set(parsed.payload.call_id, timestampMs);
           pendingApprovalAt = parsed.timestamp;
-          lastMessage = `Permission requested: ${permissionRequest}`;
+          approvalReason = permissionRequest.reason;
+          approvalCommand = permissionRequest.command;
+          lastMessage = formatPermissionMessage(permissionRequest);
         }
       }
 
@@ -287,6 +295,8 @@ async function readTranscriptInfo(transcriptPath: string, archived: boolean): Pr
     title,
     lastUserMessage,
     lastMessage,
+    approvalReason: hasPendingApproval ? approvalReason : undefined,
+    approvalCommand: hasPendingApproval ? approvalCommand : undefined,
     lastCompletionAt: hasCompletion ? lastCompletionAt : undefined,
     pendingApprovalAt: hasPendingApproval ? pendingApprovalAt : undefined,
     hasCompletion,
@@ -360,20 +370,33 @@ function isInternalUserMessage(message: string): boolean {
   return /^<(environment_context|turn_aborted|developer|system|summary)\b/i.test(message);
 }
 
-function parsePermissionRequest(rawArguments: string | undefined): string | undefined {
+type PermissionRequest = {
+  command: string;
+  reason?: string;
+};
+
+function parsePermissionRequest(rawArguments: string | undefined): PermissionRequest | undefined {
   if (!rawArguments) {
     return undefined;
   }
 
   try {
-    const parsed = JSON.parse(rawArguments) as { sandbox_permissions?: unknown; cmd?: unknown };
+    const parsed = JSON.parse(rawArguments) as { sandbox_permissions?: unknown; cmd?: unknown; justification?: unknown };
     if (parsed.sandbox_permissions !== "require_escalated") {
       return undefined;
     }
-    return typeof parsed.cmd === "string" && parsed.cmd.trim() ? parsed.cmd.trim() : "requires approval";
+    return {
+      command: typeof parsed.cmd === "string" && parsed.cmd.trim() ? parsed.cmd.trim() : "requires approval",
+      reason: typeof parsed.justification === "string" && parsed.justification.trim() ? parsed.justification.trim() : undefined
+    };
   } catch {
-    return rawArguments.includes("require_escalated") ? "requires approval" : undefined;
+    return rawArguments.includes("require_escalated") ? { command: "requires approval" } : undefined;
   }
+}
+
+function formatPermissionMessage(request: PermissionRequest): string {
+  const reason = request.reason ? `Reason: ${request.reason}\n\n` : "";
+  return `${reason}$ ${request.command}`;
 }
 
 function parseSessionIdFromPath(transcriptPath: string): string {
