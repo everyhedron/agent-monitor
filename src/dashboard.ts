@@ -6,6 +6,8 @@ import {
   archiveClaudeTranscript,
   deleteClaudeTranscript,
   findClaudeUsageProbeSessionId,
+  findLatestClaudeUsageSnapshot,
+  parseClaudeUsageText,
   scanClaudeSessions,
   unarchiveClaudeTranscript,
   type ClaudeSession,
@@ -34,6 +36,7 @@ type ClaudeUsageSummary = {
   sessionResets?: string;
   weekPercent?: number;
   weekResets?: string;
+  checkedAtMs?: number;
 };
 
 export class Dashboard {
@@ -155,6 +158,14 @@ export class Dashboard {
       claudeSessions = await scanClaudeSessions(this.getConfig().claudeHome, this.reviewState.getReviewed());
     }
     this.lastClaudeSessions = claudeSessions;
+
+    // Cheap, local-file-only check: if the user (or our own probe session) ran /usage more
+    // recently than our last known reading, adopt it - no CLI spawn needed for this to stay fresh.
+    const passiveUsage = await findLatestClaudeUsageSnapshot(this.getConfig().claudeHome);
+    if (passiveUsage && (!this.claudeUsage?.checkedAtMs || passiveUsage.checkedAtMs > this.claudeUsage.checkedAtMs)) {
+      this.claudeUsage = passiveUsage;
+    }
+
     if (this.panel) {
       this.panel.webview.html = renderDashboard(
         scan,
@@ -449,7 +460,10 @@ export class Dashboard {
         timeout: 180000,
         maxBuffer: 10 * 1024 * 1024
       });
-      this.claudeUsage = parseClaudeUsageOutput(stdout);
+      const usage = parseClaudeUsageText(stdout);
+      if (usage) {
+        this.claudeUsage = { ...usage, checkedAtMs: Date.now() };
+      }
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
       this.output.appendLine(`[${new Date().toISOString()}] ERROR fetching claude usage: ${messageText}`);
@@ -811,6 +825,21 @@ function renderDashboard(
     .usage.empty {
       display: block;
       text-align: left;
+    }
+
+    .usage-actions {
+      align-items: center;
+      display: flex;
+      justify-content: flex-end;
+    }
+
+    button.claude-usage-button {
+      background: var(--claude-accent);
+      color: #1a1a1a;
+    }
+
+    button.claude-usage-button:hover {
+      background: color-mix(in srgb, var(--claude-accent) 85%, white);
     }
 
     .usage-label {
@@ -1215,18 +1244,40 @@ function renderDashboard(
       }
     }
 
-    function requestRefresh() {
+    function setManualRefreshButtonBusy(busy) {
+      const button = document.querySelector('[data-command="refresh"]');
+      if (!button) {
+        return;
+      }
+      if (busy) {
+        button.dataset.originalLabel = button.textContent;
+        button.textContent = "Refreshing...";
+        button.classList.add("secondary");
+        button.disabled = true;
+      } else {
+        button.textContent = button.dataset.originalLabel || "Refresh";
+        button.classList.remove("secondary");
+        button.disabled = false;
+        delete button.dataset.originalLabel;
+      }
+    }
+
+    function requestRefresh(options = {}) {
       if (refreshing) {
         return;
       }
       refreshing = true;
       setRefreshStatus();
+      if (options.manual) {
+        setManualRefreshButtonBusy(true);
+      }
       vscode.postMessage({ command: "refresh" });
       clearTimeout(refreshTimeout);
       refreshTimeout = setTimeout(() => {
         refreshing = false;
         countdown = refreshSeconds;
         setRefreshStatus();
+        setManualRefreshButtonBusy(false);
       }, Math.max(10000, refreshSeconds * 3000));
     }
 
@@ -1236,6 +1287,7 @@ function renderDashboard(
         refreshing = false;
         countdown = refreshSeconds;
         setRefreshStatus();
+        setManualRefreshButtonBusy(false);
       }
     });
 
@@ -1281,7 +1333,7 @@ function renderDashboard(
       }
 
       if (commandElement.dataset.command === "refresh") {
-        requestRefresh();
+        requestRefresh({ manual: true });
         return;
       }
 
@@ -1605,14 +1657,15 @@ function renderClaudeStatus(status: ClaudeSessionStatus): string {
 }
 
 function renderClaudeUsageSection(usage: ClaudeUsageSummary | undefined, fetching: boolean): string {
-  const refreshButton = `<button class="secondary" type="button" data-command="refreshClaudeUsage" ${
+  const refreshButton = `<button class="${fetching ? "secondary" : "claude-usage-button"}" type="button" data-command="refreshClaudeUsage" ${
     fetching ? "disabled" : ""
-  }>${fetching ? "Checking..." : "Check Claude usage"}</button>`;
+  }>${fetching ? "Checking..." : "Check usage"}</button>`;
+  const titleAttr = usage?.checkedAtMs ? ` title="${escapeAttr(`Usage checked ${formatDate(usage.checkedAtMs)}`)}"` : "";
 
-  return `<section class="usage claude-usage">
+  return `<section class="usage claude-usage"${titleAttr}>
     ${renderClaudeUsageWindow("Session usage", usage?.sessionPercent, usage?.sessionResets)}
     ${renderClaudeUsageWindow("Week usage", usage?.weekPercent, usage?.weekResets)}
-    <div>${refreshButton}</div>
+    <div class="usage-actions">${refreshButton}</div>
   </section>`;
 }
 
@@ -1630,21 +1683,6 @@ function renderClaudeUsageWindow(label: string, percent: number | undefined, res
   }</span></div>
     <div class="usage-track"><div class="usage-fill" style="width: ${Math.min(100, percent)}%"></div></div>
   </div>`;
-}
-
-function parseClaudeUsageOutput(output: string): ClaudeUsageSummary | undefined {
-  const sessionMatch = output.match(/Current session:\s*(\d+)%\s*used(?:\s*·\s*resets\s*([^\n]+))?/i);
-  const weekMatch = output.match(/Current week \(all models\):\s*(\d+)%\s*used(?:\s*·\s*resets\s*([^\n]+))?/i);
-  if (!sessionMatch && !weekMatch) {
-    return undefined;
-  }
-
-  return {
-    sessionPercent: sessionMatch ? Number(sessionMatch[1]) : undefined,
-    sessionResets: sessionMatch?.[2]?.trim(),
-    weekPercent: weekMatch ? Number(weekMatch[1]) : undefined,
-    weekResets: weekMatch?.[2]?.trim()
-  };
 }
 
 function renderUsage(scan: AgentScan): string {

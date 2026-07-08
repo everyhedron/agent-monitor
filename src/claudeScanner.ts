@@ -52,6 +52,9 @@ export async function findClaudeUsageProbeSessionId(claudeHome: string): Promise
   return undefined;
 }
 
+// A "/usage" probe session never invokes the model - the local command's output shows up as a
+// standalone `system`/`local_command` line, not an assistant turn. So "probe-only" means "has a
+// /usage local-command result, and has never produced a real assistant message".
 async function readUsageProbeSessionId(transcriptPath: string): Promise<string | undefined> {
   let content: string;
   try {
@@ -61,8 +64,8 @@ async function readUsageProbeSessionId(transcriptPath: string): Promise<string |
   }
 
   let sessionId = path.basename(transcriptPath, ".jsonl");
-  let userMessageCount = 0;
-  let allUserMessagesAreUsageCommand = true;
+  let hasAssistantMessage = false;
+  let hasUsageLocalCommand = false;
 
   for (const line of content.split("\n")) {
     const trimmed = line.trim();
@@ -81,18 +84,93 @@ async function readUsageProbeSessionId(transcriptPath: string): Promise<string |
       sessionId = parsed.sessionId;
     }
 
-    if (parsed.type === "user" && parsed.message?.role === "user" && !parsed.isMeta) {
-      const text = extractText(parsed.message.content);
-      if (text && !isInternalUserMessage(text)) {
-        userMessageCount += 1;
-        if (text.trim() !== "/usage") {
-          allUserMessagesAreUsageCommand = false;
-        }
-      }
+    if (parsed.type === "assistant") {
+      hasAssistantMessage = true;
+    }
+
+    if (parsed.type === "system" && parsed.subtype === "local_command" && parsed.content && parseClaudeUsageText(parsed.content)) {
+      hasUsageLocalCommand = true;
     }
   }
 
-  return userMessageCount > 0 && allUserMessagesAreUsageCommand ? sessionId : undefined;
+  return hasUsageLocalCommand && !hasAssistantMessage ? sessionId : undefined;
+}
+
+export type ClaudeUsageSnapshot = {
+  sessionPercent?: number;
+  sessionResets?: string;
+  weekPercent?: number;
+  weekResets?: string;
+  checkedAtMs: number;
+};
+
+export function parseClaudeUsageText(output: string): Omit<ClaudeUsageSnapshot, "checkedAtMs"> | undefined {
+  const sessionMatch = output.match(/Current session:\s*(\d+)%\s*used(?:\s*·\s*resets\s*([^\n]+))?/i);
+  const weekMatch = output.match(/Current week \(all models\):\s*(\d+)%\s*used(?:\s*·\s*resets\s*([^\n]+))?/i);
+  if (!sessionMatch && !weekMatch) {
+    return undefined;
+  }
+
+  return {
+    sessionPercent: sessionMatch ? Number(sessionMatch[1]) : undefined,
+    sessionResets: sessionMatch?.[2]?.trim(),
+    weekPercent: weekMatch ? Number(weekMatch[1]) : undefined,
+    weekResets: weekMatch?.[2]?.trim()
+  };
+}
+
+// Scans every transcript (active + archived) for the freshest "/usage" local-command result,
+// whether it came from our own probe session or from the user manually running /usage in a real
+// chat. This is pure local file reading - no CLI spawn - so it's cheap enough to run on every
+// periodic refresh instead of only on the manual "Check Claude usage" button.
+export async function findLatestClaudeUsageSnapshot(claudeHome: string): Promise<ClaudeUsageSnapshot | undefined> {
+  const files = [
+    ...(await walkJsonl(path.join(claudeHome, "projects"))),
+    ...(await walkJsonl(path.join(claudeHome, "archived_sessions")))
+  ].filter((file) => !isSubagentTranscript(file));
+
+  let latest: ClaudeUsageSnapshot | undefined;
+
+  await Promise.all(
+    files.map(async (file) => {
+      let content: string;
+      try {
+        content = await fs.readFile(file, "utf8");
+      } catch {
+        return;
+      }
+
+      for (const line of content.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.includes("local_command")) {
+          continue;
+        }
+
+        let parsed: ClaudeTranscriptLine & { timestamp?: string };
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch {
+          continue;
+        }
+
+        if (parsed.type !== "system" || parsed.subtype !== "local_command" || !parsed.content) {
+          continue;
+        }
+
+        const usage = parseClaudeUsageText(parsed.content);
+        const checkedAtMs = parsed.timestamp ? Date.parse(parsed.timestamp) : NaN;
+        if (!usage || !Number.isFinite(checkedAtMs)) {
+          continue;
+        }
+
+        if (!latest || checkedAtMs > latest.checkedAtMs) {
+          latest = { ...usage, checkedAtMs };
+        }
+      }
+    })
+  );
+
+  return latest;
 }
 
 export async function archiveClaudeTranscript(claudeHome: string, transcriptPath: string): Promise<string> {
@@ -206,6 +284,7 @@ type ClaudeTranscriptLine = {
   aiTitle?: string;
   slug?: string;
   sessionId?: string;
+  content?: string;
   message?: { role?: string; content?: unknown; usage?: ClaudeUsageRaw };
   compactMetadata?: { postTokens?: number };
 };
@@ -235,8 +314,8 @@ async function readClaudeSession(
   let lastRunTokens = 0;
   let contextTokens = 0;
   let hasUsage = false;
-  let userMessageCount = 0;
-  let allUserMessagesAreUsageCommand = true;
+  let hasAssistantMessage = false;
+  let hasUsageLocalCommand = false;
 
   for (const line of content.split("\n")) {
     const trimmed = line.trim();
@@ -272,24 +351,31 @@ async function readClaudeSession(
     }
 
     if (parsed.type === "system" && parsed.subtype === "compact_boundary" && parsed.compactMetadata?.postTokens !== undefined) {
+      // Compaction isn't a new user turn, so it shouldn't reset lastRunTokens - only contextTokens
+      // actually changes here.
       contextTokens = parsed.compactMetadata.postTokens;
       hasUsage = true;
-      lastRunTokens = 0;
+    }
+
+    if (parsed.type === "system" && parsed.subtype === "local_command" && parsed.content && parseClaudeUsageText(parsed.content)) {
+      hasUsageLocalCommand = true;
     }
 
     if (parsed.type === "user" && parsed.message?.role === "user" && !parsed.isMeta) {
       const text = extractText(parsed.message.content);
-      if (text && !isInternalUserMessage(text)) {
-        userMessageCount += 1;
-        if (text.trim() !== "/usage") {
-          allUserMessagesAreUsageCommand = false;
-        }
+      if (text && !isInjectedArtifact(text)) {
+        // A bare slash command like "/compact" is still worth showing as the last user message
+        // (it tells you a compaction just happened), but it isn't a new unit of work, so it
+        // shouldn't reset the last-run token count.
         lastUserMessage = text;
-        lastRunTokens = 0;
+        if (!isSlashCommand(text)) {
+          lastRunTokens = 0;
+        }
       }
     }
 
     if (parsed.type === "assistant" && parsed.message?.role === "assistant") {
+      hasAssistantMessage = true;
       const text = extractText(parsed.message.content);
       if (text) {
         lastMessage = text;
@@ -306,9 +392,10 @@ async function readClaudeSession(
     }
   }
 
-  if (userMessageCount > 0 && allUserMessagesAreUsageCommand) {
-    // A "claude -p /usage" probe session - hidden from the dashboard, but left on disk so a
-    // later usage check can resume it instead of spawning a fresh session every time.
+  if (hasUsageLocalCommand && !hasAssistantMessage) {
+    // A "/usage" probe session (run interactively, or via "claude -p /usage") - hidden from the
+    // dashboard, but left on disk so a later usage check can resume it instead of spawning a
+    // fresh session every time.
     return undefined;
   }
 
@@ -335,8 +422,22 @@ async function readClaudeSession(
   };
 }
 
-function isInternalUserMessage(message: string): boolean {
-  return /^<(command-name|command-message|command-args|local-command-stdout|system-reminder)\b/i.test(message);
+const COMPACT_CONTINUATION_PREFIX = "This session is being continued from a previous conversation";
+
+// Content injected by the CLI itself rather than typed by the user: command-wrapper tags, and the
+// auto-generated continuation summary that follows a compaction. Never worth showing as "the last
+// user message" and never a real new unit of work.
+function isInjectedArtifact(message: string): boolean {
+  const trimmed = message.trim();
+  return (
+    /^<(command-name|command-message|command-args|local-command-stdout|local-command-caveat|system-reminder)\b/i.test(trimmed) ||
+    trimmed.startsWith(COMPACT_CONTINUATION_PREFIX)
+  );
+}
+
+// A bare slash-command invocation, e.g. "/compact" or "/usage" typed directly.
+function isSlashCommand(message: string): boolean {
+  return /^\/[a-z][a-z0-9_-]*$/i.test(message.trim());
 }
 
 function extractText(content: unknown): string | undefined {
