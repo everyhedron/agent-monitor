@@ -11,7 +11,7 @@ import {
 import { updateAgentMonitorOptions, type AgentMonitorConfig } from "./config";
 import { ReviewState } from "./reviewState";
 import { archiveTranscript, deleteArchivedTranscript, scanAgents, unarchiveTranscript } from "./scanner";
-import type { AgentScan, AgentSession, AgentStatus, AgentUsage } from "./types";
+import type { AgentScan, AgentSession, AgentStatus } from "./types";
 
 export const dashboardViewType = "agentMonitor.dashboard";
 
@@ -127,7 +127,15 @@ export class Dashboard {
       this.logDiagnostics(scan);
     }
     this.lastScan = scan;
-    this.lastClaudeSessions = await scanClaudeSessions(this.getConfig().claudeHome);
+    let claudeSessions = await scanClaudeSessions(this.getConfig().claudeHome, this.reviewState.getReviewed());
+    const runningReviewedClaudeIds = claudeSessions
+      .filter((session) => (session.status === "running" || session.status === "needs-input") && session.reviewedAt)
+      .map((session) => session.id);
+    if (runningReviewedClaudeIds.length > 0) {
+      await this.reviewState.markUnreviewed(runningReviewedClaudeIds);
+      claudeSessions = await scanClaudeSessions(this.getConfig().claudeHome, this.reviewState.getReviewed());
+    }
+    this.lastClaudeSessions = claudeSessions;
     if (this.panel) {
       this.panel.webview.html = renderDashboard(scan, this.getConfig(), this.lastClaudeSessions);
     }
@@ -184,6 +192,16 @@ export class Dashboard {
         return;
       }
 
+      if (message.command === "approveClaudeSession" && message.sessionId) {
+        await this.approveClaudeSession(message.sessionId);
+        return;
+      }
+
+      if (message.command === "alwaysApproveClaudeSession" && message.sessionId) {
+        await this.alwaysApproveClaudeSession(message.sessionId);
+        return;
+      }
+
       if (message.command === "compactSession" && message.sessionId) {
         await this.sendCompact(message.sessionId);
         return;
@@ -210,6 +228,17 @@ export class Dashboard {
       }
 
       if (message.command === "markUnreviewed" && message.sessionId) {
+        await this.reviewState.markUnreviewed([message.sessionId]);
+        await this.refresh();
+        return;
+      }
+
+      if (message.command === "markClaudeReviewed" && message.sessionId) {
+        await this.markClaudeReviewed(message.sessionId);
+        return;
+      }
+
+      if (message.command === "markClaudeUnreviewed" && message.sessionId) {
         await this.reviewState.markUnreviewed([message.sessionId]);
         await this.refresh();
         return;
@@ -299,13 +328,55 @@ export class Dashboard {
     existingTerminal.sendText(approval);
   }
 
+  async approveClaudeSession(sessionId: string): Promise<void> {
+    const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
+    const terminalName = claudeTerminalNameForSession(session?.name);
+    const existingTerminal = vscode.window.terminals.find((terminal) => terminal.name === terminalName);
+    if (!existingTerminal) {
+      this.openClaudeAgent(sessionId);
+      void vscode.window.showWarningMessage(`Agent Monitor opened ${terminalName}. Send approval again once the prompt is visible.`);
+      return;
+    }
+
+    existingTerminal.show();
+    await vscode.commands.executeCommand("workbench.action.terminal.sendSequence", { text: "\r" });
+  }
+
+  async alwaysApproveClaudeSession(sessionId: string): Promise<void> {
+    const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
+    const terminalName = claudeTerminalNameForSession(session?.name);
+    const existingTerminal = vscode.window.terminals.find((terminal) => terminal.name === terminalName);
+    if (!existingTerminal) {
+      this.openClaudeAgent(sessionId);
+      void vscode.window.showWarningMessage(`Agent Monitor opened ${terminalName}. Send approval again once the prompt is visible.`);
+      return;
+    }
+
+    existingTerminal.show();
+    await vscode.commands.executeCommand("workbench.action.terminal.sendSequence", { text: "\x1b[B" });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await vscode.commands.executeCommand("workbench.action.terminal.sendSequence", { text: "\r" });
+  }
+
   async markReviewed(sessionId: string): Promise<void> {
     await this.reviewState.markReviewed([sessionId]);
     if (this.getConfig().autoCompactOnReview) {
       const session = this.lastScan?.sessions.find((session) => session.id === sessionId);
-      const contextPercent = computeContextPercent(session?.usage);
+      const contextPercent = computeContextPercent(session?.usage?.lastTokenUsage?.inputTokens);
       if (contextPercent === undefined || contextPercent > 0) {
         await this.sendCompact(sessionId);
+      }
+    }
+    await this.refresh();
+  }
+
+  async markClaudeReviewed(sessionId: string): Promise<void> {
+    await this.reviewState.markReviewed([sessionId]);
+    if (this.getConfig().autoCompactOnReview) {
+      const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
+      const contextPercent = computeContextPercent(session?.usage?.contextTokens);
+      if (contextPercent === undefined || contextPercent > 0) {
+        await this.sendClaudeCompact(sessionId);
       }
     }
     await this.refresh();
@@ -908,8 +979,30 @@ function renderDashboard(scan: AgentScan, config: AgentMonitorConfig, claudeSess
       color: color-mix(in srgb, var(--claude-accent) 80%, white);
     }
 
-    .name-ai {
+    .name-fallback {
       color: var(--approval);
+    }
+
+    .usage-fill.over-limit {
+      background: var(--approval);
+    }
+
+    .card.claude .usage-fill.over-limit {
+      background: var(--approval);
+    }
+
+    .inline-action.static {
+      cursor: default;
+      text-decoration: none;
+    }
+
+    .inline-action.static:hover {
+      color: var(--vscode-textLink-foreground);
+      text-decoration: none;
+    }
+
+    .card.claude .inline-action.static:hover {
+      color: var(--claude-accent);
     }
 
     @media (max-width: 760px) {
@@ -1137,6 +1230,7 @@ function combineSummaries(summary: AgentScan["summary"], claudeSessions: ClaudeS
   const running = claudeSessions.filter((session) => session.status === "running").length;
   const needsApproval = claudeSessions.filter((session) => session.status === "needs-input").length;
   const done = claudeSessions.filter((session) => session.status === "idle").length;
+  const reviewed = claudeSessions.filter((session) => session.status === "reviewed").length;
   const archived = claudeSessions.filter((session) => session.status === "archived").length;
 
   return {
@@ -1144,27 +1238,27 @@ function combineSummaries(summary: AgentScan["summary"], claudeSessions: ClaudeS
     running: summary.running + running,
     needsApproval: summary.needsApproval + needsApproval,
     doneReview: summary.doneReview + done,
-    reviewed: summary.reviewed,
+    reviewed: summary.reviewed + reviewed,
     archived: summary.archived + archived,
     unknown: summary.unknown
   };
 }
 
-function computeContextPercent(usage: AgentUsage | undefined): number | undefined {
-  const contextTokens = usage?.lastTokenUsage?.inputTokens;
-  const contextWindow = usage?.modelContextWindow;
-  if (contextTokens === undefined || contextWindow === undefined || contextWindow <= 0) {
+const CONTEXT_WINDOW_TOKENS = 200_000;
+
+function computeContextPercent(contextTokens: number | undefined): number | undefined {
+  if (contextTokens === undefined) {
     return undefined;
   }
 
-  return Math.max(0, Math.min(100, (contextTokens / contextWindow) * 100));
+  return Math.max(0, (contextTokens / CONTEXT_WINDOW_TOKENS) * 100);
 }
 
 function renderSessionCard(session: AgentSession): string {
   return `<article class="card" data-session-status="${escapeAttr(session.status)}">
     <div class="card-top">
       <div>
-        <h2>${escapeHtml(session.name)}</h2>
+        <h2 class="${session.nameIsFallback ? "name-fallback" : ""}">${escapeHtml(session.name)}</h2>
         <div class="meta session-id">${renderOpenSessionLink(session)}</div>
       </div>
       ${renderStatus(session.status)}
@@ -1208,6 +1302,10 @@ function renderSessionRow(session: AgentSession): string {
 }
 
 function renderOpenSessionLink(session: AgentSession): string {
+  if (session.status === "archived") {
+    return `<span class="inline-action static" title="Archived chats can't be opened">${escapeHtml(session.id)}</span>`;
+  }
+
   return `<button class="inline-action" type="button" data-command="openAgent" data-session-id="${escapeAttr(session.id)}" title="Open agent terminal">${escapeHtml(session.id)}</button>`;
 }
 
@@ -1231,11 +1329,11 @@ function renderSessionUsage(session: AgentSession): string {
   const totalTokens = usage.totalTokenUsage?.totalTokens;
   const lastTokens = usage.lastUserTurnTokenUsage?.totalTokens ?? usage.lastTokenUsage?.totalTokens;
   const contextTokens = usage.lastTokenUsage?.inputTokens;
-  const contextWindow = usage.modelContextWindow;
-  const contextPercent = computeContextPercent(usage);
+  const contextPercent = computeContextPercent(contextTokens);
+  const overLimit = contextPercent !== undefined && contextPercent > 100;
   const contextTitle =
-    contextTokens !== undefined && contextWindow !== undefined
-      ? `${formatNumber(contextTokens)} / ${formatNumber(contextWindow)} tokens`
+    contextTokens !== undefined
+      ? `${formatNumber(contextTokens)} / ${formatNumber(CONTEXT_WINDOW_TOKENS)} tokens (assumed)`
       : "Context window unavailable";
   const totalTitle = totalTokens !== undefined ? `${formatNumber(totalTokens)} total tokens` : "Total tokens unavailable";
   const lastTitle =
@@ -1252,7 +1350,7 @@ function renderSessionUsage(session: AgentSession): string {
     <div class="meta" title="${escapeAttr(totalTitle)}">Total ${totalTokens !== undefined ? escapeHtml(formatCompactNumber(totalTokens)) : "unknown"} tokens</div>
     <div class="meta" title="${escapeAttr(lastTitle)}">Last run ${lastTokens !== undefined ? escapeHtml(formatCompactNumber(lastTokens)) : "unknown"} tokens${deltaText ? ` · ${escapeHtml(deltaText)}` : ""}</div>
     <div class="meta" title="${escapeAttr(contextTitle)}">Context ${contextPercent !== undefined ? `${Math.round(contextPercent)}%` : "unknown"}</div>
-    <div class="usage-track" title="${escapeAttr(contextTitle)}"><div class="usage-fill" style="width: ${contextPercent ?? 0}%"></div></div>
+    <div class="usage-track" title="${escapeAttr(contextTitle)}"><div class="usage-fill${overLimit ? " over-limit" : ""}" style="width: ${Math.min(100, contextPercent ?? 0)}%"></div></div>
   </div>`;
 }
 
@@ -1309,14 +1407,17 @@ function renderClaudeSessionCard(session: ClaudeSession & { isOpenInTerminal: bo
   return `<article class="card claude" data-session-status="${escapeAttr(claudeStatusInfo(session.status).badgeClass)}">
     <div class="card-top">
       <div>
-        <h2 class="${session.nameIsAiGenerated ? "name-ai" : ""}">${escapeHtml(session.name)}</h2>
+        <h2 class="${session.nameIsAiGenerated ? "name-fallback" : ""}">${escapeHtml(session.name)}</h2>
         <div class="meta session-id">${renderOpenClaudeSessionLink(session)}</div>
       </div>
       ${renderClaudeStatus(session.status)}
     </div>
     <dl>
       <dt>Updated</dt>
-      <dd>${escapeHtml(formatDate(session.updatedAtMs))}</dd>
+      <dd>
+        <div>${escapeHtml(formatDate(session.updatedAtMs))}</div>
+        ${session.reviewedAt ? `<div class="meta">reviewed ${escapeHtml(formatDate(session.reviewedAt))}</div>` : ""}
+      </dd>
       <dt>User</dt>
       <dd><div class="message" title="${escapeAttr(session.lastUserMessage || "")}">${escapeHtml(truncateLines(session.lastUserMessage || "No user message found."))}</div></dd>
       <dt>Agent</dt>
@@ -1330,6 +1431,10 @@ function renderClaudeSessionCard(session: ClaudeSession & { isOpenInTerminal: bo
 }
 
 function renderOpenClaudeSessionLink(session: ClaudeSession): string {
+  if (session.status === "archived") {
+    return `<span class="inline-action static" title="Archived chats can't be opened">${escapeHtml(session.id)}</span>`;
+  }
+
   return `<button class="inline-action" type="button" data-command="openClaudeAgent" data-session-id="${escapeAttr(session.id)}" title="Resume Claude session">${escapeHtml(session.id)}</button>`;
 }
 
@@ -1346,14 +1451,27 @@ function renderClaudeSessionUsage(session: ClaudeSession): string {
     return `<div class="meta">No usage data</div>`;
   }
 
+  const contextPercent = computeContextPercent(usage.contextTokens);
+  const overLimit = contextPercent !== undefined && contextPercent > 100;
+  const contextTitle = `${formatNumber(usage.contextTokens)} / ${formatNumber(CONTEXT_WINDOW_TOKENS)} tokens (assumed)`;
+
   return `<div class="session-usage">
     <div class="meta">Total ${escapeHtml(formatCompactNumber(usage.totalTokens))} tokens</div>
     <div class="meta">Last run ${escapeHtml(formatCompactNumber(usage.lastRunTokens))} tokens</div>
-    <div class="meta">Context ${escapeHtml(formatCompactNumber(usage.contextTokens))} tokens</div>
+    <div class="meta" title="${escapeAttr(contextTitle)}">Context ${contextPercent !== undefined ? `${Math.round(contextPercent)}%` : "unknown"}</div>
+    <div class="usage-track" title="${escapeAttr(contextTitle)}"><div class="usage-fill${overLimit ? " over-limit" : ""}" style="width: ${Math.min(100, contextPercent ?? 0)}%"></div></div>
   </div>`;
 }
 
 function renderClaudeActions(session: ClaudeSession & { isOpenInTerminal: boolean }): string {
+  const reviewButton =
+    session.status === "needs-input"
+      ? `<button type="button" data-command="approveClaudeSession" data-session-id="${escapeAttr(session.id)}">Approve</button><button type="button" data-command="alwaysApproveClaudeSession" data-session-id="${escapeAttr(session.id)}">Always Approve</button>`
+      : session.status === "archived" || session.status === "running"
+      ? ""
+      : session.status === "reviewed"
+      ? `<button class="secondary" type="button" data-command="markClaudeUnreviewed" data-session-id="${escapeAttr(session.id)}">Unreview</button>`
+      : `<button type="button" data-command="markClaudeReviewed" data-session-id="${escapeAttr(session.id)}">Reviewed</button>`;
   const compactButton = session.isOpenInTerminal
     ? `<button class="secondary" type="button" data-command="compactClaudeSession" data-session-id="${escapeAttr(session.id)}">Compact</button>`
     : "";
@@ -1366,7 +1484,7 @@ function renderClaudeActions(session: ClaudeSession & { isOpenInTerminal: boolea
       ? `<button class="secondary" type="button" data-command="unarchiveClaudeSession" data-session-id="${escapeAttr(session.id)}">Unarchive</button><button class="secondary" type="button" data-command="deleteClaudeSession" data-session-id="${escapeAttr(session.id)}">Delete</button>`
       : "";
 
-  return `${compactButton}${archiveButton}${archivedActions}`;
+  return `${compactButton}${archiveButton}${archivedActions}${reviewButton}`;
 }
 
 function claudeStatusInfo(status: ClaudeSessionStatus): { badgeClass: string; label: string } {
@@ -1377,6 +1495,8 @@ function claudeStatusInfo(status: ClaudeSessionStatus): { badgeClass: string; la
       return { badgeClass: "needs-approval", label: "needs input" };
     case "archived":
       return { badgeClass: "archived", label: "archived" };
+    case "reviewed":
+      return { badgeClass: "reviewed", label: "reviewed" };
     case "idle":
     default:
       return { badgeClass: "done-review", label: "done" };

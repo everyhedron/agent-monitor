@@ -28,6 +28,7 @@ type TranscriptInfo = {
   mtimeMs: number;
   archived: boolean;
   title?: string;
+  firstUserMessage?: string;
   lastUserMessage?: string;
   lastMessage?: string;
   approvalReason?: string;
@@ -53,7 +54,13 @@ export async function scanAgents(config: AgentMonitorConfig, reviewed: ReviewMap
   const transcriptStartedAt = Date.now();
   const transcripts = await readAllTranscripts(config.codexHome, diagnostics);
   const transcriptsMs = Date.now() - transcriptStartedAt;
-  const sessions = index.map((session) => buildAgentSession(session, config, reviewed, activeProcessCount, transcripts));
+  const indexedIds = new Set(index.map((session) => session.id));
+  const unindexedEntries: IndexedSession[] = [...transcripts.keys()]
+    .filter((sessionId) => !indexedIds.has(sessionId))
+    .map((sessionId) => ({ id: sessionId }));
+  const sessions = [...index, ...unindexedEntries].map((session) =>
+    buildAgentSession(session, config, reviewed, activeProcessCount, transcripts)
+  );
   const sortedSessions = sessions.sort((a, b) => b.updatedAtMs - a.updatedAtMs);
 
   return {
@@ -83,10 +90,14 @@ function buildAgentSession(
   const updatedAtMs = parseTime(session.updated_at) ?? transcript?.mtimeMs ?? 0;
   const reviewedAt = reviewed[session.id];
   const status = deriveStatus(transcript, reviewedAt, config.runningActivitySeconds, activeProcessCount);
+  const fallbackName = transcript?.firstUserMessage ? truncate(transcript.firstUserMessage, 60) : session.id;
+  const name = session.thread_name?.trim() || transcript?.title || fallbackName;
+  const nameIsFallback = !session.thread_name?.trim() && !transcript?.title;
 
   return {
     id: session.id,
-    name: session.thread_name?.trim() || transcript?.title || session.id,
+    name,
+    nameIsFallback,
     status,
     updatedAt: session.updated_at,
     updatedAtMs,
@@ -100,6 +111,11 @@ function buildAgentSession(
     reviewedAt,
     usage: transcript?.usage
   };
+}
+
+function truncate(value: string, maxLength: number): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 1)}...` : normalized;
 }
 
 function deriveStatus(
@@ -232,6 +248,7 @@ async function readTranscriptInfo(
   }
   let sessionId = parseSessionIdFromPath(transcriptPath);
   let title: string | undefined;
+  let firstUserMessage: string | undefined;
   let lastUserMessage: string | undefined;
   let lastMessage: string | undefined;
   let approvalReason: string | undefined;
@@ -293,6 +310,9 @@ async function readTranscriptInfo(
         const userMessage = extractUserMessage(parsed.payload);
         if (userMessage) {
           lastUserMessage = userMessage;
+          if (firstUserMessage === undefined) {
+            firstUserMessage = userMessage;
+          }
         }
       }
 
@@ -362,6 +382,7 @@ async function readTranscriptInfo(
     mtimeMs: stat.mtimeMs,
     archived,
     title,
+    firstUserMessage,
     lastUserMessage,
     lastMessage,
     approvalReason: hasPendingApproval ? approvalReason : undefined,

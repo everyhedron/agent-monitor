@@ -1,7 +1,8 @@
 import * as fs from "fs/promises";
 import * as path from "path";
+import type { ReviewMap } from "./reviewState";
 
-export type ClaudeSessionStatus = "running" | "needs-input" | "idle" | "archived";
+export type ClaudeSessionStatus = "running" | "needs-input" | "idle" | "reviewed" | "archived";
 
 export type ClaudeUsage = {
   totalTokens: number;
@@ -19,18 +20,25 @@ export type ClaudeSession = {
   lastUserMessage?: string;
   lastMessage?: string;
   usage?: ClaudeUsage;
+  reviewedAt?: string;
 };
 
-export async function scanClaudeSessions(claudeHome: string): Promise<ClaudeSession[]> {
+export async function scanClaudeSessions(claudeHome: string, reviewed: ReviewMap): Promise<ClaudeSession[]> {
   const liveStatus = await readLiveStatuses(claudeHome);
-  const activeFiles = await walkJsonl(path.join(claudeHome, "projects"));
-  const archivedFiles = await walkJsonl(path.join(claudeHome, "archived_sessions"));
-  const activeSessions = await Promise.all(activeFiles.map((file) => readClaudeSession(file, liveStatus, false)));
-  const archivedSessions = await Promise.all(archivedFiles.map((file) => readClaudeSession(file, liveStatus, true)));
+  const activeFiles = (await walkJsonl(path.join(claudeHome, "projects"))).filter((file) => !isSubagentTranscript(file));
+  const archivedFiles = (await walkJsonl(path.join(claudeHome, "archived_sessions"))).filter(
+    (file) => !isSubagentTranscript(file)
+  );
+  const activeSessions = await Promise.all(activeFiles.map((file) => readClaudeSession(file, liveStatus, false, reviewed)));
+  const archivedSessions = await Promise.all(archivedFiles.map((file) => readClaudeSession(file, liveStatus, true, reviewed)));
 
   return [...activeSessions, ...archivedSessions]
     .filter((session): session is ClaudeSession => session !== undefined)
     .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
+}
+
+function isSubagentTranscript(filePath: string): boolean {
+  return filePath.split(path.sep).includes("subagents");
 }
 
 export async function archiveClaudeTranscript(claudeHome: string, transcriptPath: string): Promise<string> {
@@ -136,7 +144,8 @@ type ClaudeTranscriptLine = {
 async function readClaudeSession(
   transcriptPath: string,
   liveStatus: Map<string, ClaudeSessionStatus>,
-  archived: boolean
+  archived: boolean,
+  reviewed: ReviewMap
 ): Promise<ClaudeSession | undefined> {
   let stat: Awaited<ReturnType<typeof fs.stat>>;
   let content: string;
@@ -217,17 +226,25 @@ async function readClaudeSession(
   }
 
   const nameIsAiGenerated = !customTitle && !agentName && !!aiTitle;
+  const reviewedAt = reviewed[sessionId];
+  const liveOrIdleStatus = liveStatus.get(sessionId) ?? "idle";
+  const status: ClaudeSessionStatus = archived
+    ? "archived"
+    : liveOrIdleStatus === "idle" && reviewedAt
+    ? "reviewed"
+    : liveOrIdleStatus;
 
   return {
     id: sessionId,
     name: customTitle || agentName || aiTitle || slug || sessionId,
     nameIsAiGenerated,
-    status: archived ? "archived" : liveStatus.get(sessionId) ?? "idle",
+    status,
     updatedAtMs: stat.mtimeMs,
     transcriptPath,
     lastUserMessage,
     lastMessage,
-    usage: hasUsage ? { totalTokens, lastRunTokens, contextTokens } : undefined
+    usage: hasUsage ? { totalTokens, lastRunTokens, contextTokens } : undefined,
+    reviewedAt
   };
 }
 

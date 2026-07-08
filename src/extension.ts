@@ -58,7 +58,9 @@ export function deactivate(): void {}
 class DoneNotifier {
   private timer: NodeJS.Timeout | undefined;
   private initialized = false;
+  private claudeInitialized = false;
   private lastStatusById = new Map<string, string>();
+  private lastClaudeStatusById = new Map<string, string>();
   private polling = false;
 
   constructor(
@@ -101,10 +103,11 @@ class DoneNotifier {
         scan = await scanAgents(cfg, this.reviewState.getReviewed());
         this.logDiagnostics(scan);
       }
-      const claudeSessions = await scanClaudeSessions(cfg.claudeHome);
+      const claudeSessions = await scanClaudeSessions(cfg.claudeHome, this.reviewState.getReviewed());
       this.updateStatusBar(scan.sessions, claudeSessions);
       if (cfg.notifyOnDone) {
         await this.notifyTransitions(scan.sessions);
+        await this.notifyClaudeTransitions(claudeSessions);
       }
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
@@ -126,7 +129,9 @@ class DoneNotifier {
       done:
         sessions.filter((session) => session.status === "done-review").length +
         claudeSessions.filter((session) => session.status === "idle").length,
-      reviewed: sessions.filter((session) => session.status === "reviewed").length,
+      reviewed:
+        sessions.filter((session) => session.status === "reviewed").length +
+        claudeSessions.filter((session) => session.status === "reviewed").length,
       archived:
         sessions.filter((session) => session.status === "archived").length +
         claudeSessions.filter((session) => session.status === "archived").length,
@@ -210,6 +215,43 @@ class DoneNotifier {
         this.dashboard.openAgent(session.id);
       }
     }
+  }
+
+  private async notifyClaudeTransitions(sessions: ClaudeSession[]): Promise<void> {
+    const nextStatusById = new Map<string, string>();
+
+    for (const session of sessions) {
+      nextStatusById.set(session.id, session.status);
+      const previousStatus = this.lastClaudeStatusById.get(session.id);
+      if (this.claudeInitialized && previousStatus !== "needs-input" && session.status === "needs-input") {
+        const choice = await vscode.window.showWarningMessage(
+          `Approval needed: ${session.name}`,
+          "Open Monitor",
+          "Open Agent",
+          "Approve",
+          "Always Approve"
+        );
+
+        if (choice === "Open Monitor") {
+          this.dashboard.open();
+        }
+
+        if (choice === "Open Agent") {
+          this.dashboard.openClaudeAgent(session.id);
+        }
+
+        if (choice === "Approve") {
+          await this.dashboard.approveClaudeSession(session.id);
+        }
+
+        if (choice === "Always Approve") {
+          await this.dashboard.alwaysApproveClaudeSession(session.id);
+        }
+      }
+    }
+
+    this.lastClaudeStatusById = nextStatusById;
+    this.claudeInitialized = true;
   }
 
   private logDiagnostics(scan: AgentScan): void {

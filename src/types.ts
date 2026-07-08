@@ -3,6 +3,7 @@ export type AgentStatus = "running" | "needs-approval" | "done-review" | "review
 export type AgentSession = {
   id: string;
   name: string;
+  nameIsFallback: boolean;
   status: AgentStatus;
   updatedAt?: string;
   updatedAtMs: number;
