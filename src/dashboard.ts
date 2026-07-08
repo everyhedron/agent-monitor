@@ -1,8 +1,11 @@
+import { execFile } from "child_process";
 import * as os from "os";
+import { promisify } from "util";
 import * as vscode from "vscode";
 import {
   archiveClaudeTranscript,
   deleteClaudeTranscript,
+  findClaudeUsageProbeSessionId,
   scanClaudeSessions,
   unarchiveClaudeTranscript,
   type ClaudeSession,
@@ -15,13 +18,22 @@ import type { AgentScan, AgentSession, AgentStatus } from "./types";
 
 export const dashboardViewType = "agentMonitor.dashboard";
 
+const execFileAsync = promisify(execFile);
+
 type DashboardMessage = {
   command?: string;
   sessionId?: string;
   sessionIds?: string[];
   path?: string;
-  setting?: "openOnStartup" | "pinOnStartup" | "autoCompactOnReview";
+  setting?: "autoCompactOnReview";
   value?: boolean;
+};
+
+type ClaudeUsageSummary = {
+  sessionPercent?: number;
+  sessionResets?: string;
+  weekPercent?: number;
+  weekResets?: string;
 };
 
 export class Dashboard {
@@ -30,20 +42,28 @@ export class Dashboard {
   private lastScan: AgentScan | undefined;
   private lastClaudeSessions: ClaudeSession[] = [];
   private refreshPromise: Promise<AgentScan> | undefined;
+  private codexTerminals = new Map<string, vscode.Terminal>();
+  private claudeTerminals = new Map<string, vscode.Terminal>();
+  private claudeUsage: ClaudeUsageSummary | undefined;
+  private claudeUsageFetching = false;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly reviewState: ReviewState,
     private getConfig: () => AgentMonitorConfig,
     private readonly output: vscode.OutputChannel
-  ) {}
+  ) {
+    context.subscriptions.push(
+      vscode.window.onDidCloseTerminal((terminal) => {
+        deleteByValue(this.codexTerminals, terminal);
+        deleteByValue(this.claudeTerminals, terminal);
+      })
+    );
+  }
 
-  open(pin = false): void {
+  open(): void {
     if (this.panel) {
       this.panel.reveal(vscode.ViewColumn.One);
-      if (pin) {
-        void this.pinPanel();
-      }
       void this.refresh();
       return;
     }
@@ -54,9 +74,6 @@ export class Dashboard {
     });
 
     this.attachPanel(panel);
-    if (pin) {
-      void this.pinPanel();
-    }
   }
 
   restore(panel: vscode.WebviewPanel): void {
@@ -64,10 +81,6 @@ export class Dashboard {
       enableScripts: true
     };
     this.attachPanel(panel);
-  }
-
-  hasPanel(): boolean {
-    return this.panel !== undefined;
   }
 
   private attachPanel(panel: vscode.WebviewPanel): void {
@@ -102,9 +115,15 @@ export class Dashboard {
     void this.refresh();
   }
 
-  async refresh(): Promise<AgentScan> {
-    if (this.refreshPromise) {
+  async refresh(options?: { force?: boolean }): Promise<AgentScan> {
+    if (this.refreshPromise && !options?.force) {
       return this.refreshPromise;
+    }
+
+    if (this.refreshPromise) {
+      // An in-flight scan may have started before a mutation (archive/delete/etc.) landed on
+      // disk, so it can't be reused here - wait for it to settle, then run a fresh one.
+      await this.refreshPromise.catch(() => undefined);
     }
 
     this.refreshPromise = this.doRefresh();
@@ -137,7 +156,17 @@ export class Dashboard {
     }
     this.lastClaudeSessions = claudeSessions;
     if (this.panel) {
-      this.panel.webview.html = renderDashboard(scan, this.getConfig(), this.lastClaudeSessions);
+      this.panel.webview.html = renderDashboard(
+        scan,
+        this.getConfig(),
+        this.lastClaudeSessions,
+        {
+          codex: new Set(this.codexTerminals.keys()),
+          claude: new Set(this.claudeTerminals.keys())
+        },
+        this.claudeUsage,
+        this.claudeUsageFetching
+      );
     }
     return scan;
   }
@@ -212,6 +241,11 @@ export class Dashboard {
         return;
       }
 
+      if (message.command === "refreshClaudeUsage") {
+        await this.refreshClaudeUsage();
+        return;
+      }
+
       if (message.command === "openTranscript" && message.path) {
         await vscode.window.showTextDocument(vscode.Uri.file(message.path), { preview: false });
         return;
@@ -229,7 +263,7 @@ export class Dashboard {
 
       if (message.command === "markUnreviewed" && message.sessionId) {
         await this.reviewState.markUnreviewed([message.sessionId]);
-        await this.refresh();
+        await this.refresh({ force: true });
         return;
       }
 
@@ -240,7 +274,7 @@ export class Dashboard {
 
       if (message.command === "markClaudeUnreviewed" && message.sessionId) {
         await this.reviewState.markUnreviewed([message.sessionId]);
-        await this.refresh();
+        await this.refresh({ force: true });
         return;
       }
 
@@ -281,46 +315,47 @@ export class Dashboard {
   }
 
   openAgent(sessionId: string): void {
-    const session = this.lastScan?.sessions.find((session) => session.id === sessionId);
-    const terminalName = terminalNameForSession(session?.name);
-    const existingTerminal = vscode.window.terminals.find((terminal) => terminal.name === terminalName);
+    const existingTerminal = this.codexTerminals.get(sessionId);
     if (existingTerminal) {
       existingTerminal.show();
       return;
     }
 
+    const session = this.lastScan?.sessions.find((session) => session.id === sessionId);
     const terminal = vscode.window.createTerminal({
       cwd: os.homedir(),
-      name: terminalName
+      name: terminalNameForSession(session?.name)
     });
+    this.codexTerminals.set(sessionId, terminal);
     terminal.show();
     terminal.sendText(`codex resume ${sessionId}`);
   }
 
   openClaudeAgent(sessionId: string): void {
-    const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
-    const terminalName = claudeTerminalNameForSession(session?.name);
-    const existingTerminal = vscode.window.terminals.find((terminal) => terminal.name === terminalName);
+    const existingTerminal = this.claudeTerminals.get(sessionId);
     if (existingTerminal) {
       existingTerminal.show();
       return;
     }
 
+    const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
     const terminal = vscode.window.createTerminal({
       cwd: os.homedir(),
-      name: terminalName
+      name: claudeTerminalNameForSession(session?.name)
     });
+    this.claudeTerminals.set(sessionId, terminal);
     terminal.show();
     terminal.sendText(`claude --resume ${sessionId}`);
   }
 
   sendApproval(sessionId: string, approval: "y" | "p"): void {
-    const session = this.lastScan?.sessions.find((session) => session.id === sessionId);
-    const terminalName = terminalNameForSession(session?.name);
-    const existingTerminal = vscode.window.terminals.find((terminal) => terminal.name === terminalName);
+    const existingTerminal = this.codexTerminals.get(sessionId);
     if (!existingTerminal) {
+      const session = this.lastScan?.sessions.find((session) => session.id === sessionId);
       this.openAgent(sessionId);
-      void vscode.window.showWarningMessage(`Agent Monitor opened ${terminalName}. Send approval again once the prompt is visible.`);
+      void vscode.window.showWarningMessage(
+        `Agent Monitor opened ${terminalNameForSession(session?.name)}. Send approval again once the prompt is visible.`
+      );
       return;
     }
 
@@ -329,12 +364,13 @@ export class Dashboard {
   }
 
   async approveClaudeSession(sessionId: string): Promise<void> {
-    const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
-    const terminalName = claudeTerminalNameForSession(session?.name);
-    const existingTerminal = vscode.window.terminals.find((terminal) => terminal.name === terminalName);
+    const existingTerminal = this.claudeTerminals.get(sessionId);
     if (!existingTerminal) {
+      const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
       this.openClaudeAgent(sessionId);
-      void vscode.window.showWarningMessage(`Agent Monitor opened ${terminalName}. Send approval again once the prompt is visible.`);
+      void vscode.window.showWarningMessage(
+        `Agent Monitor opened ${claudeTerminalNameForSession(session?.name)}. Send approval again once the prompt is visible.`
+      );
       return;
     }
 
@@ -343,12 +379,13 @@ export class Dashboard {
   }
 
   async alwaysApproveClaudeSession(sessionId: string): Promise<void> {
-    const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
-    const terminalName = claudeTerminalNameForSession(session?.name);
-    const existingTerminal = vscode.window.terminals.find((terminal) => terminal.name === terminalName);
+    const existingTerminal = this.claudeTerminals.get(sessionId);
     if (!existingTerminal) {
+      const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
       this.openClaudeAgent(sessionId);
-      void vscode.window.showWarningMessage(`Agent Monitor opened ${terminalName}. Send approval again once the prompt is visible.`);
+      void vscode.window.showWarningMessage(
+        `Agent Monitor opened ${claudeTerminalNameForSession(session?.name)}. Send approval again once the prompt is visible.`
+      );
       return;
     }
 
@@ -367,7 +404,7 @@ export class Dashboard {
         await this.sendCompact(sessionId);
       }
     }
-    await this.refresh();
+    await this.refresh({ force: true });
   }
 
   async markClaudeReviewed(sessionId: string): Promise<void> {
@@ -379,23 +416,56 @@ export class Dashboard {
         await this.sendClaudeCompact(sessionId);
       }
     }
-    await this.refresh();
+    await this.refresh({ force: true });
   }
 
   async sendCompact(sessionId: string): Promise<void> {
     const session = this.lastScan?.sessions.find((session) => session.id === sessionId);
     const terminalName = terminalNameForSession(session?.name);
-    await this.sendCompactToTerminal(terminalName, () => this.openAgent(sessionId));
+    await this.sendCompactToTerminal(this.codexTerminals.get(sessionId), terminalName, () => this.openAgent(sessionId));
   }
 
   async sendClaudeCompact(sessionId: string): Promise<void> {
     const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
     const terminalName = claudeTerminalNameForSession(session?.name);
-    await this.sendCompactToTerminal(terminalName, () => this.openClaudeAgent(sessionId));
+    await this.sendCompactToTerminal(this.claudeTerminals.get(sessionId), terminalName, () => this.openClaudeAgent(sessionId));
   }
 
-  private async sendCompactToTerminal(terminalName: string, openIfMissing: () => void): Promise<void> {
-    const existingTerminal = vscode.window.terminals.find((terminal) => terminal.name === terminalName);
+  async refreshClaudeUsage(): Promise<void> {
+    if (this.claudeUsageFetching) {
+      return;
+    }
+
+    this.claudeUsageFetching = true;
+    // Reflect the "Checking..." state right away - the CLI call below can take far longer than
+    // a normal refresh cycle, so it must not block the periodic scan/render loop while it runs.
+    await this.refresh({ force: true });
+
+    try {
+      const claudeHome = this.getConfig().claudeHome;
+      const existingSessionId = await findClaudeUsageProbeSessionId(claudeHome);
+      const args = existingSessionId ? ["-p", "--resume", existingSessionId, "/usage"] : ["-p", "/usage"];
+      const { stdout } = await execFileAsync("claude", args, {
+        timeout: 180000,
+        maxBuffer: 10 * 1024 * 1024
+      });
+      this.claudeUsage = parseClaudeUsageOutput(stdout);
+    } catch (error) {
+      const messageText = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`[${new Date().toISOString()}] ERROR fetching claude usage: ${messageText}`);
+      void vscode.window.showErrorMessage(`Agent Monitor: could not fetch Claude usage (${messageText}).`);
+    } finally {
+      this.claudeUsageFetching = false;
+    }
+
+    await this.refresh({ force: true });
+  }
+
+  private async sendCompactToTerminal(
+    existingTerminal: vscode.Terminal | undefined,
+    terminalName: string,
+    openIfMissing: () => void
+  ): Promise<void> {
     if (existingTerminal) {
       existingTerminal.show();
       await vscode.commands.executeCommand("workbench.action.terminal.sendSequence", { text: "/compact" });
@@ -409,8 +479,7 @@ export class Dashboard {
     void vscode.window.showWarningMessage(`Auto compact failed for ${terminalName}. Paste /compact into the terminal manually.`);
   }
 
-  private async confirmCloseTerminalIfOpen(terminalName: string): Promise<boolean> {
-    const terminal = vscode.window.terminals.find((t) => t.name === terminalName);
+  private async confirmCloseTerminalIfOpen(terminalName: string, terminal: vscode.Terminal | undefined): Promise<boolean> {
     if (!terminal) {
       return true;
     }
@@ -435,13 +504,17 @@ export class Dashboard {
       return;
     }
 
-    const shouldProceed = await this.confirmCloseTerminalIfOpen(terminalNameForSession(session.name));
+    const shouldProceed = await this.confirmCloseTerminalIfOpen(
+      terminalNameForSession(session.name),
+      this.codexTerminals.get(sessionId)
+    );
     if (!shouldProceed) {
       return;
     }
+    this.codexTerminals.delete(sessionId);
 
     await archiveTranscript(this.getConfig().codexHome, session.transcriptPath);
-    await this.refresh();
+    await this.refresh({ force: true });
   }
 
   async unarchiveSession(sessionId: string): Promise<void> {
@@ -452,7 +525,7 @@ export class Dashboard {
     }
 
     await unarchiveTranscript(this.getConfig().codexHome, session.transcriptPath);
-    await this.refresh();
+    await this.refresh({ force: true });
   }
 
   async deleteSession(sessionId: string): Promise<void> {
@@ -473,7 +546,7 @@ export class Dashboard {
 
     await deleteArchivedTranscript(this.getConfig().codexHome, sessionId, session.transcriptPath);
     await this.reviewState.markUnreviewed([sessionId]);
-    await this.refresh();
+    await this.refresh({ force: true });
   }
 
   async archiveClaudeSession(sessionId: string): Promise<void> {
@@ -483,13 +556,17 @@ export class Dashboard {
       return;
     }
 
-    const shouldProceed = await this.confirmCloseTerminalIfOpen(claudeTerminalNameForSession(session.name));
+    const shouldProceed = await this.confirmCloseTerminalIfOpen(
+      claudeTerminalNameForSession(session.name),
+      this.claudeTerminals.get(sessionId)
+    );
     if (!shouldProceed) {
       return;
     }
+    this.claudeTerminals.delete(sessionId);
 
     await archiveClaudeTranscript(this.getConfig().claudeHome, session.transcriptPath);
-    await this.refresh();
+    await this.refresh({ force: true });
   }
 
   async unarchiveClaudeSession(sessionId: string): Promise<void> {
@@ -500,7 +577,7 @@ export class Dashboard {
     }
 
     await unarchiveClaudeTranscript(this.getConfig().claudeHome, session.transcriptPath);
-    await this.refresh();
+    await this.refresh({ force: true });
   }
 
   async deleteClaudeSession(sessionId: string): Promise<void> {
@@ -520,12 +597,7 @@ export class Dashboard {
     }
 
     await deleteClaudeTranscript(session.transcriptPath);
-    await this.refresh();
-  }
-
-  private async pinPanel(): Promise<void> {
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    await vscode.commands.executeCommand("workbench.action.pinEditor");
+    await this.refresh({ force: true });
   }
 
   private logDiagnostics(scan: AgentScan): void {
@@ -540,15 +612,21 @@ export class Dashboard {
   }
 }
 
-function renderDashboard(scan: AgentScan, config: AgentMonitorConfig, claudeSessions: ClaudeSession[]): string {
-  const openTerminalNames = new Set(vscode.window.terminals.map((terminal) => terminal.name));
+function renderDashboard(
+  scan: AgentScan,
+  config: AgentMonitorConfig,
+  claudeSessions: ClaudeSession[],
+  openSessionIds: { codex: Set<string>; claude: Set<string> },
+  claudeUsage: ClaudeUsageSummary | undefined,
+  claudeUsageFetching: boolean
+): string {
   const sessions = scan.sessions.map((session) => ({
     ...session,
-    isOpenInTerminal: openTerminalNames.has(terminalNameForSession(session.name))
+    isOpenInTerminal: openSessionIds.codex.has(session.id)
   }));
   const claudeSessionsWithTerminal = claudeSessions.map((session) => ({
     ...session,
-    isOpenInTerminal: openTerminalNames.has(claudeTerminalNameForSession(session.name))
+    isOpenInTerminal: openSessionIds.claude.has(session.id)
   }));
   const rows = sessions.map(renderSessionRow).join("");
   const combinedCards = [
@@ -585,6 +663,7 @@ function renderDashboard(scan: AgentScan, config: AgentMonitorConfig, claudeSess
       --archived: #a371f7;
       --unknown: #8b949e;
       --claude-accent: #f0883e;
+      --overflow: #e3b341;
     }
 
     * {
@@ -979,16 +1058,24 @@ function renderDashboard(scan: AgentScan, config: AgentMonitorConfig, claudeSess
       color: color-mix(in srgb, var(--claude-accent) 80%, white);
     }
 
-    .name-fallback {
-      color: var(--approval);
+    .name-fallback-codex {
+      color: var(--reviewed);
+    }
+
+    .name-fallback-claude {
+      color: var(--claude-accent);
+    }
+
+    .card.claude .usage-fill {
+      background: var(--claude-accent);
     }
 
     .usage-fill.over-limit {
-      background: var(--approval);
+      background: var(--overflow);
     }
 
     .card.claude .usage-fill.over-limit {
-      background: var(--approval);
+      background: var(--overflow);
     }
 
     .inline-action.static {
@@ -1025,8 +1112,6 @@ function renderDashboard(scan: AgentScan, config: AgentMonitorConfig, claudeSess
         <div class="summary" title="${escapeAttr(summaryTitle)}">${combinedSummary.total} sessions · <span id="refresh-status">Refreshing in <span id="refresh-countdown">${refreshSeconds}</span>s</span></div>
       </div>
       <div class="header-actions">
-        <label class="checkbox-control"><input type="checkbox" data-setting="openOnStartup" ${config.openOnStartup ? "checked" : ""}> Open on startup</label>
-        <label class="checkbox-control"><input type="checkbox" data-setting="pinOnStartup" ${config.pinOnStartup ? "checked" : ""}> Pin on startup</label>
         <label class="checkbox-control"><input type="checkbox" data-setting="autoCompactOnReview" ${config.autoCompactOnReview ? "checked" : ""}> Auto compact on review</label>
         <button type="button" data-command="refresh">Refresh</button>
       </div>
@@ -1042,7 +1127,7 @@ function renderDashboard(scan: AgentScan, config: AgentMonitorConfig, claudeSess
     </section>
 
     ${renderUsage(scan)}
-    ${renderClaudeUsagePlaceholder()}
+    ${renderClaudeUsageSection(claudeUsage, claudeUsageFetching)}
 
     <section class="toolbar">
       <div class="toolbar-group" role="group" aria-label="Agent view">
@@ -1073,7 +1158,10 @@ function renderDashboard(scan: AgentScan, config: AgentMonitorConfig, claudeSess
   <script>
     const vscode = acquireVsCodeApi();
     const persistedState = vscode.getState() || {};
-    const selectedStatuses = new Set(persistedState.selectedStatuses || []);
+    const allStatuses = [...document.querySelectorAll("[data-stat-status]")]
+      .map((element) => element.dataset.statStatus)
+      .filter((status) => status !== "all");
+    const selectedStatuses = new Set(persistedState.selectedStatuses ?? allStatuses);
     const refreshSeconds = ${refreshSeconds};
     let countdown = refreshSeconds;
     let refreshing = false;
@@ -1218,6 +1306,14 @@ function renderDashboard(scan: AgentScan, config: AgentMonitorConfig, claudeSess
 </html>`;
 }
 
+function deleteByValue<K>(map: Map<K, vscode.Terminal>, value: vscode.Terminal): void {
+  for (const [key, terminal] of map) {
+    if (terminal === value) {
+      map.delete(key);
+    }
+  }
+}
+
 function terminalNameForSession(sessionName: string | undefined): string {
   return `${sessionName?.trim() || "Agent"} | Codex`;
 }
@@ -1258,7 +1354,7 @@ function renderSessionCard(session: AgentSession): string {
   return `<article class="card" data-session-status="${escapeAttr(session.status)}">
     <div class="card-top">
       <div>
-        <h2 class="${session.nameIsFallback ? "name-fallback" : ""}">${escapeHtml(session.name)}</h2>
+        <h2 class="${session.nameIsFallback ? "name-fallback-codex" : ""}">${escapeHtml(session.name)}</h2>
         <div class="meta session-id">${renderOpenSessionLink(session)}</div>
       </div>
       ${renderStatus(session.status)}
@@ -1407,7 +1503,7 @@ function renderClaudeSessionCard(session: ClaudeSession & { isOpenInTerminal: bo
   return `<article class="card claude" data-session-status="${escapeAttr(claudeStatusInfo(session.status).badgeClass)}">
     <div class="card-top">
       <div>
-        <h2 class="${session.nameIsAiGenerated ? "name-fallback" : ""}">${escapeHtml(session.name)}</h2>
+        <h2 class="${session.nameIsAiGenerated ? "name-fallback-claude" : ""}">${escapeHtml(session.name)}</h2>
         <div class="meta session-id">${renderOpenClaudeSessionLink(session)}</div>
       </div>
       ${renderClaudeStatus(session.status)}
@@ -1508,13 +1604,47 @@ function renderClaudeStatus(status: ClaudeSessionStatus): string {
   return `<span class="badge ${info.badgeClass}">${escapeHtml(info.label)}</span>`;
 }
 
-function renderClaudeUsagePlaceholder(): string {
+function renderClaudeUsageSection(usage: ClaudeUsageSummary | undefined, fetching: boolean): string {
+  const refreshButton = `<button class="secondary" type="button" data-command="refreshClaudeUsage" ${
+    fetching ? "disabled" : ""
+  }>${fetching ? "Checking..." : "Check Claude usage"}</button>`;
+
   return `<section class="usage claude-usage">
-    <div class="usage-window">
-      <div class="usage-label"><strong>Claude usage</strong><span>not yet available</span></div>
-      <div class="usage-track"><div class="usage-fill" style="width: 50%"></div></div>
-    </div>
+    ${renderClaudeUsageWindow("Session usage", usage?.sessionPercent, usage?.sessionResets)}
+    ${renderClaudeUsageWindow("Week usage", usage?.weekPercent, usage?.weekResets)}
+    <div>${refreshButton}</div>
   </section>`;
+}
+
+function renderClaudeUsageWindow(label: string, percent: number | undefined, resets: string | undefined): string {
+  if (percent === undefined) {
+    return `<div class="usage-window">
+      <div class="usage-label"><strong>${escapeHtml(label)}</strong><span>not checked yet</span></div>
+      <div class="usage-track"><div class="usage-fill" style="width: 0%"></div></div>
+    </div>`;
+  }
+
+  return `<div class="usage-window">
+    <div class="usage-label"><strong>${escapeHtml(label)}</strong><span>${percent}% used${
+    resets ? ` · resets ${escapeHtml(resets)}` : ""
+  }</span></div>
+    <div class="usage-track"><div class="usage-fill" style="width: ${Math.min(100, percent)}%"></div></div>
+  </div>`;
+}
+
+function parseClaudeUsageOutput(output: string): ClaudeUsageSummary | undefined {
+  const sessionMatch = output.match(/Current session:\s*(\d+)%\s*used(?:\s*·\s*resets\s*([^\n]+))?/i);
+  const weekMatch = output.match(/Current week \(all models\):\s*(\d+)%\s*used(?:\s*·\s*resets\s*([^\n]+))?/i);
+  if (!sessionMatch && !weekMatch) {
+    return undefined;
+  }
+
+  return {
+    sessionPercent: sessionMatch ? Number(sessionMatch[1]) : undefined,
+    sessionResets: sessionMatch?.[2]?.trim(),
+    weekPercent: weekMatch ? Number(weekMatch[1]) : undefined,
+    weekResets: weekMatch?.[2]?.trim()
+  };
 }
 
 function renderUsage(scan: AgentScan): string {

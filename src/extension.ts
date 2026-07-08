@@ -42,14 +42,6 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
-  if (config.openOnStartup) {
-    setTimeout(() => {
-      if (!dashboard.hasPanel()) {
-        dashboard.open(config.pinOnStartup);
-      }
-    }, 1000);
-  }
-
   notifier.start();
 }
 
@@ -137,10 +129,8 @@ class DoneNotifier {
         claudeSessions.filter((session) => session.status === "archived").length,
       unknown: sessions.filter((session) => session.status === "unknown").length
     };
-    this.statusBarItem.text =
-      counts.needsApproval > 0
-        ? `$(alert) ${counts.needsApproval} · $(hubot) ${counts.done}/${total}`
-        : `$(hubot) ${counts.done}/${total}`;
+    const needsAttention = counts.needsApproval + counts.done;
+    this.statusBarItem.text = `$(hubot) ${needsAttention}/${total}`;
     this.statusBarItem.tooltip = [
       "Agent Monitor",
       `Needs approval: ${counts.needsApproval}`,

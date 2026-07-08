@@ -41,6 +41,60 @@ function isSubagentTranscript(filePath: string): boolean {
   return filePath.split(path.sep).includes("subagents");
 }
 
+export async function findClaudeUsageProbeSessionId(claudeHome: string): Promise<string | undefined> {
+  const files = (await walkJsonl(path.join(claudeHome, "projects"))).filter((file) => !isSubagentTranscript(file));
+  for (const file of files) {
+    const sessionId = await readUsageProbeSessionId(file);
+    if (sessionId) {
+      return sessionId;
+    }
+  }
+  return undefined;
+}
+
+async function readUsageProbeSessionId(transcriptPath: string): Promise<string | undefined> {
+  let content: string;
+  try {
+    content = await fs.readFile(transcriptPath, "utf8");
+  } catch {
+    return undefined;
+  }
+
+  let sessionId = path.basename(transcriptPath, ".jsonl");
+  let userMessageCount = 0;
+  let allUserMessagesAreUsageCommand = true;
+
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+
+    let parsed: ClaudeTranscriptLine;
+    try {
+      parsed = JSON.parse(trimmed) as ClaudeTranscriptLine;
+    } catch {
+      continue;
+    }
+
+    if (parsed.sessionId) {
+      sessionId = parsed.sessionId;
+    }
+
+    if (parsed.type === "user" && parsed.message?.role === "user" && !parsed.isMeta) {
+      const text = extractText(parsed.message.content);
+      if (text && !isInternalUserMessage(text)) {
+        userMessageCount += 1;
+        if (text.trim() !== "/usage") {
+          allUserMessagesAreUsageCommand = false;
+        }
+      }
+    }
+  }
+
+  return userMessageCount > 0 && allUserMessagesAreUsageCommand ? sessionId : undefined;
+}
+
 export async function archiveClaudeTranscript(claudeHome: string, transcriptPath: string): Promise<string> {
   const projectDir = path.basename(path.dirname(transcriptPath));
   const archivedDir = path.join(claudeHome, "archived_sessions", projectDir);
@@ -79,8 +133,8 @@ async function readLiveStatuses(claudeHome: string): Promise<Map<string, ClaudeS
       .map(async (entry) => {
         try {
           const content = await fs.readFile(path.join(dir, entry), "utf8");
-          const parsed = JSON.parse(content) as { sessionId?: string; status?: string };
-          if (parsed.sessionId && parsed.status) {
+          const parsed = JSON.parse(content) as { pid?: number; sessionId?: string; status?: string };
+          if (parsed.sessionId && parsed.status && isPidAlive(parsed.pid)) {
             statuses.set(parsed.sessionId, normalizeStatus(parsed.status));
           }
         } catch {
@@ -90,6 +144,19 @@ async function readLiveStatuses(claudeHome: string): Promise<Map<string, ClaudeS
   );
 
   return statuses;
+}
+
+function isPidAlive(pid: number | undefined): boolean {
+  if (pid === undefined) {
+    return true;
+  }
+
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function normalizeStatus(status: string): ClaudeSessionStatus {
@@ -132,6 +199,7 @@ type ClaudeUsageRaw = {
 
 type ClaudeTranscriptLine = {
   type?: string;
+  subtype?: string;
   isMeta?: boolean;
   customTitle?: string;
   agentName?: string;
@@ -139,6 +207,7 @@ type ClaudeTranscriptLine = {
   slug?: string;
   sessionId?: string;
   message?: { role?: string; content?: unknown; usage?: ClaudeUsageRaw };
+  compactMetadata?: { postTokens?: number };
 };
 
 async function readClaudeSession(
@@ -166,6 +235,8 @@ async function readClaudeSession(
   let lastRunTokens = 0;
   let contextTokens = 0;
   let hasUsage = false;
+  let userMessageCount = 0;
+  let allUserMessagesAreUsageCommand = true;
 
   for (const line of content.split("\n")) {
     const trimmed = line.trim();
@@ -200,9 +271,19 @@ async function readClaudeSession(
       slug = parsed.slug;
     }
 
+    if (parsed.type === "system" && parsed.subtype === "compact_boundary" && parsed.compactMetadata?.postTokens !== undefined) {
+      contextTokens = parsed.compactMetadata.postTokens;
+      hasUsage = true;
+      lastRunTokens = 0;
+    }
+
     if (parsed.type === "user" && parsed.message?.role === "user" && !parsed.isMeta) {
       const text = extractText(parsed.message.content);
       if (text && !isInternalUserMessage(text)) {
+        userMessageCount += 1;
+        if (text.trim() !== "/usage") {
+          allUserMessagesAreUsageCommand = false;
+        }
         lastUserMessage = text;
         lastRunTokens = 0;
       }
@@ -223,6 +304,12 @@ async function readClaudeSession(
         contextTokens = (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0);
       }
     }
+  }
+
+  if (userMessageCount > 0 && allUserMessagesAreUsageCommand) {
+    // A "claude -p /usage" probe session - hidden from the dashboard, but left on disk so a
+    // later usage check can resume it instead of spawning a fresh session every time.
+    return undefined;
   }
 
   const nameIsAiGenerated = !customTitle && !agentName && !!aiTitle;

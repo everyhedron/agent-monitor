@@ -65,16 +65,6 @@
           "default": true,
           "description": "Show a VS Code notification when a running chat becomes done."
         },
-        "agentMonitor.openOnStartup": {
-          "type": "boolean",
-          "default": false,
-          "description": "Open the Agent Monitor dashboard when VS Code starts."
-        },
-        "agentMonitor.pinOnStartup": {
-          "type": "boolean",
-          "default": false,
-          "description": "Pin the Agent Monitor dashboard tab when it opens on VS Code startup."
-        },
         "agentMonitor.autoCompactOnReview": {
           "type": "boolean",
           "default": false,
