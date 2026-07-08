@@ -47,6 +47,12 @@ export class Dashboard {
   private refreshPromise: Promise<AgentScan> | undefined;
   private codexTerminals = new Map<string, vscode.Terminal>();
   private claudeTerminals = new Map<string, vscode.Terminal>();
+  // Sessions whose "running" status right now is our own auto-compact-on-review sendCompact call,
+  // not new user activity - guards against doRefresh's "unreview if running again" heuristic
+  // immediately undoing the review it was just given. Cleared once the session is observed no
+  // longer running (the compact finished), so genuinely new activity afterwards still unreviews it.
+  private pendingReviewCompactCodexIds = new Set<string>();
+  private pendingReviewCompactClaudeIds = new Set<string>();
   private claudeUsage: ClaudeUsageSummary | undefined;
   private claudeUsageFetching = false;
 
@@ -140,8 +146,13 @@ export class Dashboard {
   private async doRefresh(): Promise<AgentScan> {
     let scan = await scanAgents(this.getConfig(), this.reviewState.getReviewed());
     this.logDiagnostics(scan);
+    for (const id of [...this.pendingReviewCompactCodexIds]) {
+      if (!scan.sessions.some((session) => session.id === id && session.status === "running")) {
+        this.pendingReviewCompactCodexIds.delete(id);
+      }
+    }
     const runningReviewedIds = scan.sessions
-      .filter((session) => session.status === "running" && session.reviewedAt)
+      .filter((session) => session.status === "running" && session.reviewedAt && !this.pendingReviewCompactCodexIds.has(session.id))
       .map((session) => session.id);
     if (runningReviewedIds.length > 0) {
       await this.reviewState.markUnreviewed(runningReviewedIds);
@@ -150,8 +161,18 @@ export class Dashboard {
     }
     this.lastScan = scan;
     let claudeSessions = await scanClaudeSessions(this.getConfig().claudeHome, this.reviewState.getReviewed());
+    for (const id of [...this.pendingReviewCompactClaudeIds]) {
+      if (!claudeSessions.some((session) => session.id === id && (session.status === "running" || session.status === "needs-input"))) {
+        this.pendingReviewCompactClaudeIds.delete(id);
+      }
+    }
     const runningReviewedClaudeIds = claudeSessions
-      .filter((session) => (session.status === "running" || session.status === "needs-input") && session.reviewedAt)
+      .filter(
+        (session) =>
+          (session.status === "running" || session.status === "needs-input") &&
+          session.reviewedAt &&
+          !this.pendingReviewCompactClaudeIds.has(session.id)
+      )
       .map((session) => session.id);
     if (runningReviewedClaudeIds.length > 0) {
       await this.reviewState.markUnreviewed(runningReviewedClaudeIds);
@@ -325,17 +346,40 @@ export class Dashboard {
     }
   }
 
+  // Looks a session's terminal up primarily by its expected tab name (matching how the user
+  // thinks about their terminals), falling back to the session-id map only when the name isn't
+  // found - which means the tab title has drifted (e.g. the shell or CLI rewrote it via an OSC
+  // escape sequence). When that happens, rename the tab back to its canonical name so future
+  // by-name lookups work again; every caller already calls `.show()` on the result right after,
+  // so this doesn't steal focus beyond what the caller was already about to do.
+  private resolveTerminal(map: Map<string, vscode.Terminal>, sessionId: string, expectedName: string): vscode.Terminal | undefined {
+    const byName = vscode.window.terminals.find((terminal) => terminal.name === expectedName);
+    if (byName) {
+      map.set(sessionId, byName);
+      return byName;
+    }
+
+    const byMap = map.get(sessionId);
+    if (byMap) {
+      byMap.show();
+      void vscode.commands.executeCommand("workbench.action.terminal.renameWithArg", { name: expectedName });
+    }
+
+    return byMap;
+  }
+
   openAgent(sessionId: string): void {
-    const existingTerminal = this.codexTerminals.get(sessionId);
+    const session = this.lastScan?.sessions.find((session) => session.id === sessionId);
+    const expectedName = terminalNameForSession(session?.name);
+    const existingTerminal = this.resolveTerminal(this.codexTerminals, sessionId, expectedName);
     if (existingTerminal) {
       existingTerminal.show();
       return;
     }
 
-    const session = this.lastScan?.sessions.find((session) => session.id === sessionId);
     const terminal = vscode.window.createTerminal({
       cwd: os.homedir(),
-      name: terminalNameForSession(session?.name)
+      name: expectedName
     });
     this.codexTerminals.set(sessionId, terminal);
     terminal.show();
@@ -343,16 +387,17 @@ export class Dashboard {
   }
 
   openClaudeAgent(sessionId: string): void {
-    const existingTerminal = this.claudeTerminals.get(sessionId);
+    const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
+    const expectedName = claudeTerminalNameForSession(session?.name);
+    const existingTerminal = this.resolveTerminal(this.claudeTerminals, sessionId, expectedName);
     if (existingTerminal) {
       existingTerminal.show();
       return;
     }
 
-    const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
     const terminal = vscode.window.createTerminal({
       cwd: os.homedir(),
-      name: claudeTerminalNameForSession(session?.name)
+      name: expectedName
     });
     this.claudeTerminals.set(sessionId, terminal);
     terminal.show();
@@ -360,13 +405,12 @@ export class Dashboard {
   }
 
   sendApproval(sessionId: string, approval: "y" | "p"): void {
-    const existingTerminal = this.codexTerminals.get(sessionId);
+    const session = this.lastScan?.sessions.find((session) => session.id === sessionId);
+    const expectedName = terminalNameForSession(session?.name);
+    const existingTerminal = this.resolveTerminal(this.codexTerminals, sessionId, expectedName);
     if (!existingTerminal) {
-      const session = this.lastScan?.sessions.find((session) => session.id === sessionId);
       this.openAgent(sessionId);
-      void vscode.window.showWarningMessage(
-        `Agent Monitor opened ${terminalNameForSession(session?.name)}. Send approval again once the prompt is visible.`
-      );
+      void vscode.window.showWarningMessage(`Agent Monitor opened ${expectedName}. Send approval again once the prompt is visible.`);
       return;
     }
 
@@ -375,13 +419,12 @@ export class Dashboard {
   }
 
   async approveClaudeSession(sessionId: string): Promise<void> {
-    const existingTerminal = this.claudeTerminals.get(sessionId);
+    const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
+    const expectedName = claudeTerminalNameForSession(session?.name);
+    const existingTerminal = this.resolveTerminal(this.claudeTerminals, sessionId, expectedName);
     if (!existingTerminal) {
-      const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
       this.openClaudeAgent(sessionId);
-      void vscode.window.showWarningMessage(
-        `Agent Monitor opened ${claudeTerminalNameForSession(session?.name)}. Send approval again once the prompt is visible.`
-      );
+      void vscode.window.showWarningMessage(`Agent Monitor opened ${expectedName}. Send approval again once the prompt is visible.`);
       return;
     }
 
@@ -390,13 +433,12 @@ export class Dashboard {
   }
 
   async alwaysApproveClaudeSession(sessionId: string): Promise<void> {
-    const existingTerminal = this.claudeTerminals.get(sessionId);
+    const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
+    const expectedName = claudeTerminalNameForSession(session?.name);
+    const existingTerminal = this.resolveTerminal(this.claudeTerminals, sessionId, expectedName);
     if (!existingTerminal) {
-      const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
       this.openClaudeAgent(sessionId);
-      void vscode.window.showWarningMessage(
-        `Agent Monitor opened ${claudeTerminalNameForSession(session?.name)}. Send approval again once the prompt is visible.`
-      );
+      void vscode.window.showWarningMessage(`Agent Monitor opened ${expectedName}. Send approval again once the prompt is visible.`);
       return;
     }
 
@@ -412,6 +454,7 @@ export class Dashboard {
       const session = this.lastScan?.sessions.find((session) => session.id === sessionId);
       const contextPercent = computeContextPercent(session?.usage?.lastTokenUsage?.inputTokens);
       if (contextPercent === undefined || contextPercent > 0) {
+        this.pendingReviewCompactCodexIds.add(sessionId);
         await this.sendCompact(sessionId);
       }
     }
@@ -424,6 +467,7 @@ export class Dashboard {
       const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
       const contextPercent = computeContextPercent(session?.usage?.contextTokens);
       if (contextPercent === undefined || contextPercent > 0) {
+        this.pendingReviewCompactClaudeIds.add(sessionId);
         await this.sendClaudeCompact(sessionId);
       }
     }
@@ -433,13 +477,15 @@ export class Dashboard {
   async sendCompact(sessionId: string): Promise<void> {
     const session = this.lastScan?.sessions.find((session) => session.id === sessionId);
     const terminalName = terminalNameForSession(session?.name);
-    await this.sendCompactToTerminal(this.codexTerminals.get(sessionId), terminalName, () => this.openAgent(sessionId));
+    const existingTerminal = this.resolveTerminal(this.codexTerminals, sessionId, terminalName);
+    await this.sendCompactToTerminal(existingTerminal, terminalName, () => this.openAgent(sessionId));
   }
 
   async sendClaudeCompact(sessionId: string): Promise<void> {
     const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
     const terminalName = claudeTerminalNameForSession(session?.name);
-    await this.sendCompactToTerminal(this.claudeTerminals.get(sessionId), terminalName, () => this.openClaudeAgent(sessionId));
+    const existingTerminal = this.resolveTerminal(this.claudeTerminals, sessionId, terminalName);
+    await this.sendCompactToTerminal(existingTerminal, terminalName, () => this.openClaudeAgent(sessionId));
   }
 
   async refreshClaudeUsage(): Promise<void> {
@@ -827,10 +873,21 @@ function renderDashboard(
       text-align: left;
     }
 
+    .claude-usage {
+      display: flex;
+      flex-wrap: wrap;
+    }
+
+    .claude-usage .usage-window {
+      flex: 1 1 220px;
+    }
+
     .usage-actions {
       align-items: center;
       display: flex;
+      flex: 0 0 auto;
       justify-content: flex-end;
+      margin-left: auto;
     }
 
     button.claude-usage-button {
@@ -1097,6 +1154,15 @@ function renderDashboard(
 
     .card.claude .usage-fill {
       background: var(--claude-accent);
+    }
+
+    .card.claude button:not(.secondary):not(.inline-action) {
+      background: var(--claude-accent);
+      color: #1a1a1a;
+    }
+
+    .card.claude button:not(.secondary):not(.inline-action):hover {
+      background: color-mix(in srgb, var(--claude-accent) 85%, white);
     }
 
     .usage-fill.over-limit {
@@ -1660,7 +1726,7 @@ function renderClaudeUsageSection(usage: ClaudeUsageSummary | undefined, fetchin
   const refreshButton = `<button class="${fetching ? "secondary" : "claude-usage-button"}" type="button" data-command="refreshClaudeUsage" ${
     fetching ? "disabled" : ""
   }>${fetching ? "Checking..." : "Check usage"}</button>`;
-  const titleAttr = usage?.checkedAtMs ? ` title="${escapeAttr(`Usage checked ${formatDate(usage.checkedAtMs)}`)}"` : "";
+  const titleAttr = usage?.checkedAtMs ? ` title="${escapeAttr(`Usage captured ${formatDate(usage.checkedAtMs)}`)}"` : "";
 
   return `<section class="usage claude-usage"${titleAttr}>
     ${renderClaudeUsageWindow("Session usage", usage?.sessionPercent, usage?.sessionResets)}

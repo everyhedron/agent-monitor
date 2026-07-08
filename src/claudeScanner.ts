@@ -84,7 +84,7 @@ async function readUsageProbeSessionId(transcriptPath: string): Promise<string |
       sessionId = parsed.sessionId;
     }
 
-    if (parsed.type === "assistant") {
+    if (parsed.type === "assistant" && parsed.message?.model !== "<synthetic>") {
       hasAssistantMessage = true;
     }
 
@@ -285,7 +285,7 @@ type ClaudeTranscriptLine = {
   slug?: string;
   sessionId?: string;
   content?: string;
-  message?: { role?: string; content?: unknown; usage?: ClaudeUsageRaw };
+  message?: { role?: string; content?: unknown; usage?: ClaudeUsageRaw; model?: string };
   compactMetadata?: { postTokens?: number };
 };
 
@@ -374,7 +374,12 @@ async function readClaudeSession(
       }
     }
 
-    if (parsed.type === "assistant" && parsed.message?.role === "assistant") {
+    if (parsed.type === "assistant" && parsed.message?.role === "assistant" && parsed.message.model !== "<synthetic>") {
+      // The CLI emits a synthetic "No response requested." assistant turn for queued local
+      // commands (e.g. a queued "/usage" or "/config") that don't actually invoke the model -
+      // marked by `message.model === "<synthetic>"`. Treating that as a real assistant turn would
+      // both defeat the usage-probe-hiding check below and clobber lastMessage with meaningless
+      // filler text.
       hasAssistantMessage = true;
       const text = extractText(parsed.message.content);
       if (text) {
