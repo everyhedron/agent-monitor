@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { scanClaudeSessions, type ClaudeSession } from "./claudeScanner";
 import { readConfig, type AgentMonitorConfig } from "./config";
 import { Dashboard, dashboardViewType } from "./dashboard";
 import { ReviewState } from "./reviewState";
@@ -100,7 +101,8 @@ class DoneNotifier {
         scan = await scanAgents(cfg, this.reviewState.getReviewed());
         this.logDiagnostics(scan);
       }
-      this.updateStatusBar(scan.sessions);
+      const claudeSessions = await scanClaudeSessions(cfg.claudeHome);
+      this.updateStatusBar(scan.sessions, claudeSessions);
       if (cfg.notifyOnDone) {
         await this.notifyTransitions(scan.sessions);
       }
@@ -112,19 +114,28 @@ class DoneNotifier {
     }
   }
 
-  private updateStatusBar(sessions: AgentSession[]): void {
-    const total = sessions.length;
+  private updateStatusBar(sessions: AgentSession[], claudeSessions: ClaudeSession[]): void {
+    const total = sessions.length + claudeSessions.length;
     const counts = {
-      running: sessions.filter((session) => session.status === "running").length,
-      needsApproval: sessions.filter((session) => session.status === "needs-approval").length,
-      done: sessions.filter((session) => session.status === "done-review").length,
+      running:
+        sessions.filter((session) => session.status === "running").length +
+        claudeSessions.filter((session) => session.status === "running").length,
+      needsApproval:
+        sessions.filter((session) => session.status === "needs-approval").length +
+        claudeSessions.filter((session) => session.status === "needs-input").length,
+      done:
+        sessions.filter((session) => session.status === "done-review").length +
+        claudeSessions.filter((session) => session.status === "idle").length,
       reviewed: sessions.filter((session) => session.status === "reviewed").length,
-      archived: sessions.filter((session) => session.status === "archived").length,
+      archived:
+        sessions.filter((session) => session.status === "archived").length +
+        claudeSessions.filter((session) => session.status === "archived").length,
       unknown: sessions.filter((session) => session.status === "unknown").length
     };
-    const needsAttention = counts.needsApproval + counts.done;
-
-    this.statusBarItem.text = `$(hubot) ${needsAttention}/${total}`;
+    this.statusBarItem.text =
+      counts.needsApproval > 0
+        ? `$(alert) ${counts.needsApproval} · $(hubot) ${counts.done}/${total}`
+        : `$(hubot) ${counts.done}/${total}`;
     this.statusBarItem.tooltip = [
       "Agent Monitor",
       `Needs approval: ${counts.needsApproval}`,

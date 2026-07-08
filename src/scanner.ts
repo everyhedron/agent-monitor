@@ -566,6 +566,62 @@ async function countActiveCodexProcesses(diagnostics: AgentScanDiagnostic[]): Pr
   }
 }
 
+export async function archiveTranscript(codexHome: string, transcriptPath: string): Promise<string> {
+  const archivedDir = path.join(codexHome, "archived_sessions");
+  await fs.mkdir(archivedDir, { recursive: true });
+  const dest = path.join(archivedDir, path.basename(transcriptPath));
+  await fs.rename(transcriptPath, dest);
+  return dest;
+}
+
+export async function unarchiveTranscript(codexHome: string, transcriptPath: string): Promise<string> {
+  const basename = path.basename(transcriptPath);
+  const match = basename.match(/^rollout-(\d{4})-(\d{2})-(\d{2})T/);
+  if (!match) {
+    throw new Error(`Could not determine original date for ${basename}`);
+  }
+
+  const [, year, month, day] = match;
+  const destDir = path.join(codexHome, "sessions", year, month, day);
+  await fs.mkdir(destDir, { recursive: true });
+  const dest = path.join(destDir, basename);
+  await fs.rename(transcriptPath, dest);
+  return dest;
+}
+
+export async function deleteArchivedTranscript(codexHome: string, sessionId: string, transcriptPath: string): Promise<void> {
+  await fs.unlink(transcriptPath);
+  await removeFromSessionIndex(codexHome, sessionId);
+}
+
+async function removeFromSessionIndex(codexHome: string, sessionId: string): Promise<void> {
+  const indexPath = path.join(codexHome, "session_index.jsonl");
+  let content: string;
+  try {
+    content = await fs.readFile(indexPath, "utf8");
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      return;
+    }
+    throw error;
+  }
+
+  const remainingLines = content.split("\n").filter((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      return false;
+    }
+    try {
+      const parsed = JSON.parse(trimmed) as { id?: string };
+      return parsed.id !== sessionId;
+    } catch {
+      return true;
+    }
+  });
+
+  await fs.writeFile(indexPath, remainingLines.length > 0 ? `${remainingLines.join("\n")}\n` : "");
+}
+
 function diagnostic(level: AgentScanDiagnostic["level"], source: string, message: string): AgentScanDiagnostic {
   return { level, source, message };
 }

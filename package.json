@@ -43,6 +43,11 @@
           "default": "",
           "description": "Path to the Codex home folder. Leave empty to use ~/.codex."
         },
+        "agentMonitor.claudeHome": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the Claude Code home folder. Leave empty to use ~/.claude."
+        },
         "agentMonitor.refreshIntervalMs": {
           "type": "number",
           "default": 5000,
