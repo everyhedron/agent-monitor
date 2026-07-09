@@ -1,5 +1,5 @@
 {
-  "name": "agent-monitor",
+  "name": "everyhedron-agent-monitor",
   "displayName": "Agent Monitor",
   "description": "VS Code dashboard for monitoring local Codex and Claude Code sessions.",
   "version": "0.0.1",
