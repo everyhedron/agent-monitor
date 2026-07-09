@@ -378,6 +378,19 @@ async function readClaudeSession(
           lastRunFinishedAtMs = undefined;
         }
       }
+    } else if (parsed.type === "user" && parsed.message?.role === "user" && parsed.isMeta) {
+      // A project/user *skill* invocation (e.g. "/todo-runner") injects its instructions as an
+      // isMeta line prefixed with this preamble, distinct from a built-in local command like
+      // "/compact" or "/usage" (which never produces this preamble). Unlike a built-in command,
+      // a skill invocation is genuine new work, so the last-run clock should reset here even
+      // though the line is otherwise filtered out as CLI-injected noise (never shown as
+      // lastUserMessage - the raw skill body is not worth surfacing in the UI).
+      const text = extractText(parsed.message.content);
+      if (text && isSkillInvocationPreamble(text)) {
+        lastRunTokens = 0;
+        lastRunStartedAtMs = parseTime(parsed.timestamp);
+        lastRunFinishedAtMs = undefined;
+      }
     }
 
     if (parsed.type === "assistant" && parsed.message?.role === "assistant" && parsed.message.model !== "<synthetic>") {
@@ -464,6 +477,12 @@ function isInjectedArtifact(message: string): boolean {
 // A bare slash-command invocation, e.g. "/compact" or "/usage" typed directly.
 function isSlashCommand(message: string): boolean {
   return /^\/[a-z][a-z0-9_-]*$/i.test(message.trim());
+}
+
+const SKILL_INVOCATION_PREAMBLE = "Base directory for this skill:";
+
+function isSkillInvocationPreamble(message: string): boolean {
+  return message.trimStart().startsWith(SKILL_INVOCATION_PREAMBLE);
 }
 
 function extractText(content: unknown): string | undefined {
