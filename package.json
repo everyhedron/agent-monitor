@@ -1,6 +1,6 @@
 {
-  "name": "everyhedron-agent-monitor",
-  "displayName": "Agent Monitor",
+  "name": "hedron-agent-monitor",
+  "displayName": "Hedron Agent Monitor",
   "description": "VS Code dashboard for monitoring local Codex and Claude Code sessions.",
   "version": "0.0.1",
   "publisher": "everyhedron",
@@ -36,15 +36,15 @@
     "commands": [
       {
         "command": "agentMonitor.openDashboard",
-        "title": "Agent Monitor: Open Dashboard"
+        "title": "Hedron Agent Monitor: Open Dashboard"
       },
       {
         "command": "agentMonitor.refresh",
-        "title": "Agent Monitor: Refresh"
+        "title": "Hedron Agent Monitor: Refresh"
       }
     ],
     "configuration": {
-      "title": "Agent Monitor",
+      "title": "Hedron Agent Monitor",
       "properties": {
         "agentMonitor.codexHome": {
           "type": "string",
