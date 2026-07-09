@@ -368,25 +368,34 @@ async function readClaudeSession(
     if (parsed.type === "user" && parsed.message?.role === "user" && !parsed.isMeta) {
       const text = extractText(parsed.message.content);
       if (text && !isInjectedArtifact(text)) {
-        // A bare slash command like "/compact" is still worth showing as the last user message
-        // (it tells you a compaction just happened), but it isn't a new unit of work, so it
-        // shouldn't reset the last-run token count or the last-run duration clock.
-        lastUserMessage = text;
-        if (!isSlashCommand(text)) {
+        const skillCommand = parseSkillLaunchMessage(text);
+        if (skillCommand) {
+          lastUserMessage = skillCommand;
           lastRunTokens = 0;
           lastRunStartedAtMs = parseTime(parsed.timestamp);
           lastRunFinishedAtMs = undefined;
+        } else {
+          // A bare slash command like "/compact" is still worth showing as the last user message
+          // (it tells you a compaction just happened), but it isn't a new unit of work, so it
+          // shouldn't reset the last-run token count or the last-run duration clock.
+          lastUserMessage = text;
+          if (!isSlashCommand(text)) {
+            lastRunTokens = 0;
+            lastRunStartedAtMs = parseTime(parsed.timestamp);
+            lastRunFinishedAtMs = undefined;
+          }
         }
       }
     } else if (parsed.type === "user" && parsed.message?.role === "user" && parsed.isMeta) {
       // A project/user *skill* invocation (e.g. "/todo-runner") injects its instructions as an
       // isMeta line prefixed with this preamble, distinct from a built-in local command like
       // "/compact" or "/usage" (which never produces this preamble). Unlike a built-in command,
-      // a skill invocation is genuine new work, so the last-run clock should reset here even
-      // though the line is otherwise filtered out as CLI-injected noise (never shown as
-      // lastUserMessage - the raw skill body is not worth surfacing in the UI).
+      // a skill invocation is genuine new work, so display the command and reset the last-run
+      // counters while still hiding the injected skill body.
       const text = extractText(parsed.message.content);
-      if (text && isSkillInvocationPreamble(text)) {
+      const skillCommand = text ? parseSkillInvocationCommand(text) : undefined;
+      if (skillCommand) {
+        lastUserMessage = skillCommand;
         lastRunTokens = 0;
         lastRunStartedAtMs = parseTime(parsed.timestamp);
         lastRunFinishedAtMs = undefined;
@@ -481,8 +490,21 @@ function isSlashCommand(message: string): boolean {
 
 const SKILL_INVOCATION_PREAMBLE = "Base directory for this skill:";
 
-function isSkillInvocationPreamble(message: string): boolean {
-  return message.trimStart().startsWith(SKILL_INVOCATION_PREAMBLE);
+function parseSkillLaunchMessage(message: string): string | undefined {
+  const match = message.trim().match(/^Launching skill:\s*([a-z0-9][a-z0-9_-]*)$/i);
+  return match ? `/${match[1]}` : undefined;
+}
+
+function parseSkillInvocationCommand(message: string): string | undefined {
+  const trimmed = message.trimStart();
+  if (!trimmed.startsWith(SKILL_INVOCATION_PREAMBLE)) {
+    return undefined;
+  }
+
+  const firstLine = trimmed.split("\n", 1)[0] ?? "";
+  const skillDir = firstLine.slice(SKILL_INVOCATION_PREAMBLE.length).trim();
+  const skillName = path.basename(skillDir);
+  return /^[a-z0-9][a-z0-9_-]*$/i.test(skillName) ? `/${skillName}` : "/skill";
 }
 
 function extractText(content: unknown): string | undefined {

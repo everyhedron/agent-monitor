@@ -306,11 +306,11 @@ async function readTranscriptInfo(
         (parsed.type === "event_msg" && parsed.payload?.type === "user_message") ||
         (parsed.type === "response_item" && parsed.payload?.type === "message" && parsed.payload.role === "user")
       ) {
-        latestUserAt = parsed.timestamp;
-        latestUserMs = timestampMs;
-        userTurnBaselineUsage = previousUsage;
         const userMessage = extractUserMessage(parsed.payload);
         if (userMessage) {
+          latestUserAt = parsed.timestamp;
+          latestUserMs = timestampMs;
+          userTurnBaselineUsage = previousUsage;
           lastUserMessage = userMessage;
           if (firstUserMessage === undefined) {
             firstUserMessage = userMessage;
@@ -537,7 +537,7 @@ function extractUserMessage(payload: { message?: string; content?: Array<{ type?
 }
 
 function isInternalUserMessage(message: string): boolean {
-  return /^<(environment_context|turn_aborted|developer|system|summary)\b/i.test(message);
+  return /^<(environment_context|skill|turn_aborted|developer|system|summary)\b/i.test(message);
 }
 
 type PermissionRequest = {
