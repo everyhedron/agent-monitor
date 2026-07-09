@@ -20,6 +20,7 @@ export type ClaudeSession = {
   lastUserMessage?: string;
   lastMessage?: string;
   usage?: ClaudeUsage;
+  lastRunDurationMs?: number;
   reviewedAt?: string;
 };
 
@@ -285,6 +286,7 @@ type ClaudeTranscriptLine = {
   slug?: string;
   sessionId?: string;
   content?: string;
+  timestamp?: string;
   message?: { role?: string; content?: unknown; usage?: ClaudeUsageRaw; model?: string };
   compactMetadata?: { postTokens?: number };
 };
@@ -316,6 +318,8 @@ async function readClaudeSession(
   let hasUsage = false;
   let hasAssistantMessage = false;
   let hasUsageLocalCommand = false;
+  let lastRunStartedAtMs: number | undefined;
+  let lastRunFinishedAtMs: number | undefined;
 
   for (const line of content.split("\n")) {
     const trimmed = line.trim();
@@ -366,10 +370,12 @@ async function readClaudeSession(
       if (text && !isInjectedArtifact(text)) {
         // A bare slash command like "/compact" is still worth showing as the last user message
         // (it tells you a compaction just happened), but it isn't a new unit of work, so it
-        // shouldn't reset the last-run token count.
+        // shouldn't reset the last-run token count or the last-run duration clock.
         lastUserMessage = text;
         if (!isSlashCommand(text)) {
           lastRunTokens = 0;
+          lastRunStartedAtMs = parseTime(parsed.timestamp);
+          lastRunFinishedAtMs = undefined;
         }
       }
     }
@@ -381,6 +387,7 @@ async function readClaudeSession(
       // both defeat the usage-probe-hiding check below and clobber lastMessage with meaningless
       // filler text.
       hasAssistantMessage = true;
+      lastRunFinishedAtMs = parseTime(parsed.timestamp) ?? lastRunFinishedAtMs;
       const text = extractText(parsed.message.content);
       if (text) {
         lastMessage = text;
@@ -404,6 +411,10 @@ async function readClaudeSession(
     return undefined;
   }
 
+  const lastRunDurationMs =
+    lastRunStartedAtMs !== undefined && lastRunFinishedAtMs !== undefined && lastRunFinishedAtMs >= lastRunStartedAtMs
+      ? lastRunFinishedAtMs - lastRunStartedAtMs
+      : undefined;
   const nameIsAiGenerated = !customTitle && !agentName && !!aiTitle;
   const reviewedAt = reviewed[sessionId];
   const liveOrIdleStatus = liveStatus.get(sessionId) ?? "idle";
@@ -423,8 +434,18 @@ async function readClaudeSession(
     lastUserMessage,
     lastMessage,
     usage: hasUsage ? { totalTokens, lastRunTokens, contextTokens } : undefined,
+    lastRunDurationMs,
     reviewedAt
   };
+}
+
+function parseTime(value: string | undefined): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 const COMPACT_CONTINUATION_PREFIX = "This session is being continued from a previous conversation";

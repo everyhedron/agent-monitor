@@ -1,14 +1,22 @@
 {
   "name": "agent-monitor",
   "displayName": "Agent Monitor",
-  "description": "VS Code dashboard for local Codex chats and review status.",
+  "description": "VS Code dashboard for monitoring local Codex and Claude Code sessions.",
   "version": "0.0.1",
   "publisher": "everyhedron",
   "license": "MIT",
   "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/everyhedron/agent-monitor.git"
+  },
+  "homepage": "https://github.com/everyhedron/agent-monitor#readme",
+  "bugs": {
+    "url": "https://github.com/everyhedron/agent-monitor/issues"
+  },
   "files": [
     "out/**",
-    "media/icon.png",
+    "media/**",
     "README.md",
     "LICENSE",
     "package.json"
@@ -21,9 +29,7 @@
   ],
   "activationEvents": [
     "onStartupFinished",
-    "onWebviewPanel:agentMonitor.dashboard",
-    "onCommand:agentMonitor.openDashboard",
-    "onCommand:agentMonitor.refresh"
+    "onWebviewPanel:agentMonitor.dashboard"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -78,7 +84,7 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "vsce package --allow-missing-repository --no-dependencies"
+    "package": "vsce package --no-dependencies"
   },
   "devDependencies": {
     "@types/node": "^20.14.10",

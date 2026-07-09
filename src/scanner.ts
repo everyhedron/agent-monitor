@@ -34,6 +34,7 @@ type TranscriptInfo = {
   approvalReason?: string;
   approvalCommand?: string;
   lastCompletionAt?: string;
+  lastRunDurationMs?: number;
   pendingApprovalAt?: string;
   hasCompletion: boolean;
   hasPendingApproval: boolean;
@@ -108,6 +109,7 @@ function buildAgentSession(
     approvalReason: transcript?.approvalReason,
     approvalCommand: transcript?.approvalCommand,
     lastCompletionAt: transcript?.lastCompletionAt,
+    lastRunDurationMs: transcript?.lastRunDurationMs,
     reviewedAt,
     usage: transcript?.usage
   };
@@ -369,6 +371,7 @@ async function readTranscriptInfo(
   }
 
   const hasCompletion = lastCompletionMs > 0 && lastCompletionMs >= latestUserMs && lastCompletionMs >= latestAbortMs;
+  const lastRunDurationMs = hasCompletion && latestUserMs > 0 ? lastCompletionMs - latestUserMs : undefined;
   const latestPendingApprovalMs = Math.max(0, ...pendingApprovalCalls.values());
   const hasPendingApproval =
     latestPendingApprovalMs > 0 &&
@@ -388,6 +391,7 @@ async function readTranscriptInfo(
     approvalReason: hasPendingApproval ? approvalReason : undefined,
     approvalCommand: hasPendingApproval ? approvalCommand : undefined,
     lastCompletionAt: hasCompletion ? lastCompletionAt : undefined,
+    lastRunDurationMs,
     pendingApprovalAt: hasPendingApproval ? pendingApprovalAt : undefined,
     hasCompletion,
     hasPendingApproval,

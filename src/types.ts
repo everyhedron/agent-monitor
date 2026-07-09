@@ -14,6 +14,7 @@ export type AgentSession = {
   approvalReason?: string;
   approvalCommand?: string;
   lastCompletionAt?: string;
+  lastRunDurationMs?: number;
   reviewedAt?: string;
   usage?: AgentUsage;
   isOpenInTerminal?: boolean;

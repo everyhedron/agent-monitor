@@ -13,6 +13,7 @@ import {
   type ClaudeSession,
   type ClaudeSessionStatus
 } from "./claudeScanner";
+import { fetchCodexUsage, type CodexManualUsage } from "./codexUsage";
 import { updateAgentMonitorOptions, type AgentMonitorConfig } from "./config";
 import { ReviewState } from "./reviewState";
 import { archiveTranscript, deleteArchivedTranscript, scanAgents, unarchiveTranscript } from "./scanner";
@@ -39,6 +40,8 @@ type ClaudeUsageSummary = {
   checkedAtMs?: number;
 };
 
+type CodexUsageSummary = CodexManualUsage & { checkedAtMs: number };
+
 export class Dashboard {
   private panel: vscode.WebviewPanel | undefined;
   private timer: NodeJS.Timeout | undefined;
@@ -55,6 +58,8 @@ export class Dashboard {
   private pendingReviewCompactClaudeIds = new Set<string>();
   private claudeUsage: ClaudeUsageSummary | undefined;
   private claudeUsageFetching = false;
+  private codexUsage: CodexUsageSummary | undefined;
+  private codexUsageFetching = false;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -197,7 +202,9 @@ export class Dashboard {
           claude: new Set(this.claudeTerminals.keys())
         },
         this.claudeUsage,
-        this.claudeUsageFetching
+        this.claudeUsageFetching,
+        this.codexUsage,
+        this.codexUsageFetching
       );
     }
     return scan;
@@ -275,6 +282,11 @@ export class Dashboard {
 
       if (message.command === "refreshClaudeUsage") {
         await this.refreshClaudeUsage();
+        return;
+      }
+
+      if (message.command === "refreshCodexUsage") {
+        await this.refreshCodexUsage();
         return;
       }
 
@@ -521,6 +533,28 @@ export class Dashboard {
     await this.refresh({ force: true });
   }
 
+  async refreshCodexUsage(): Promise<void> {
+    if (this.codexUsageFetching) {
+      return;
+    }
+
+    this.codexUsageFetching = true;
+    await this.refresh({ force: true });
+
+    try {
+      const usage = await fetchCodexUsage(this.getConfig().codexHome);
+      this.codexUsage = { ...usage, checkedAtMs: Date.now() };
+    } catch (error) {
+      const messageText = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`[${new Date().toISOString()}] ERROR fetching codex usage: ${messageText}`);
+      void vscode.window.showErrorMessage(`Agent Monitor: could not fetch Codex usage (${messageText}).`);
+    } finally {
+      this.codexUsageFetching = false;
+    }
+
+    await this.refresh({ force: true });
+  }
+
   private async sendCompactToTerminal(
     existingTerminal: vscode.Terminal | undefined,
     terminalName: string,
@@ -678,7 +712,9 @@ function renderDashboard(
   claudeSessions: ClaudeSession[],
   openSessionIds: { codex: Set<string>; claude: Set<string> },
   claudeUsage: ClaudeUsageSummary | undefined,
-  claudeUsageFetching: boolean
+  claudeUsageFetching: boolean,
+  codexUsage: CodexUsageSummary | undefined,
+  codexUsageFetching: boolean
 ): string {
   const sessions = scan.sessions.map((session) => ({
     ...session,
@@ -1216,7 +1252,7 @@ function renderDashboard(
       ${renderStat("Unknown", combinedSummary.unknown, "unknown")}
     </section>
 
-    ${renderUsage(scan)}
+    ${renderUsage(scan, codexUsage, codexUsageFetching)}
     ${renderClaudeUsageSection(claudeUsage, claudeUsageFetching)}
 
     <section class="toolbar">
@@ -1553,7 +1589,8 @@ function renderSessionUsage(session: AgentSession): string {
       : "Latest turn tokens unavailable";
   const primaryDelta = usage.lastPrimaryDeltaPercent !== undefined ? `5h +${formatPercent(usage.lastPrimaryDeltaPercent)}` : "";
   const secondaryDelta = usage.lastSecondaryDeltaPercent !== undefined ? `7d +${formatPercent(usage.lastSecondaryDeltaPercent)}` : "";
-  const deltaText = [primaryDelta, secondaryDelta].filter(Boolean).join(" · ");
+  const durationText = session.lastRunDurationMs !== undefined ? formatDuration(session.lastRunDurationMs) : "";
+  const deltaText = [primaryDelta, secondaryDelta, durationText].filter(Boolean).join(" · ");
 
   return `<div class="session-usage">
     <div class="meta" title="${escapeAttr(totalTitle)}">Total ${totalTokens !== undefined ? escapeHtml(formatCompactNumber(totalTokens)) : "unknown"} tokens</div>
@@ -1663,10 +1700,11 @@ function renderClaudeSessionUsage(session: ClaudeSession): string {
   const contextPercent = computeContextPercent(usage.contextTokens);
   const overLimit = contextPercent !== undefined && contextPercent > 100;
   const contextTitle = `${formatNumber(usage.contextTokens)} / ${formatNumber(CONTEXT_WINDOW_TOKENS)} tokens (assumed)`;
+  const durationText = session.lastRunDurationMs !== undefined ? formatDuration(session.lastRunDurationMs) : "";
 
   return `<div class="session-usage">
     <div class="meta">Total ${escapeHtml(formatCompactNumber(usage.totalTokens))} tokens</div>
-    <div class="meta">Last run ${escapeHtml(formatCompactNumber(usage.lastRunTokens))} tokens</div>
+    <div class="meta">Last run ${escapeHtml(formatCompactNumber(usage.lastRunTokens))} tokens${durationText ? ` · ${escapeHtml(durationText)}` : ""}</div>
     <div class="meta" title="${escapeAttr(contextTitle)}">Context ${contextPercent !== undefined ? `${Math.round(contextPercent)}%` : "unknown"}</div>
     <div class="usage-track" title="${escapeAttr(contextTitle)}"><div class="usage-fill${overLimit ? " over-limit" : ""}" style="width: ${Math.min(100, contextPercent ?? 0)}%"></div></div>
   </div>`;
@@ -1747,21 +1785,51 @@ function renderClaudeUsageWindow(label: string, percent: number | undefined, res
   </div>`;
 }
 
-function renderUsage(scan: AgentScan): string {
-  if (!scan.usage) {
+function renderUsage(scan: AgentScan, manualUsage: CodexUsageSummary | undefined, fetching: boolean): string {
+  const primary = combineCodexUsageWindow(
+    manualUsage ? { percent: manualUsage.primaryPercent, resetsAt: manualUsage.primaryResetsAt } : undefined,
+    scan.usage?.primary
+  );
+  const secondary = combineCodexUsageWindow(
+    manualUsage ? { percent: manualUsage.secondaryPercent, resetsAt: manualUsage.secondaryResetsAt } : undefined,
+    scan.usage?.secondary
+  );
+
+  if (!primary && !secondary) {
     return `<section class="usage empty">No usage data found in Codex transcripts.</section>`;
   }
 
-  const disabledCheckButton = `<button class="secondary" type="button" disabled title="Coming soon - manual usage checks for Codex aren't wired up yet">Check usage</button>`;
+  const checkButton = `<button class="${fetching ? "secondary" : ""}" type="button" data-command="refreshCodexUsage" ${
+    fetching ? "disabled" : ""
+  }>${fetching ? "Checking..." : "Check usage"}</button>`;
+  const capturedAtMs = manualUsage?.checkedAtMs ?? (scan.usage ? Date.parse(scan.usage.capturedAt) : undefined);
+  const titleAttr = capturedAtMs !== undefined ? ` title="${escapeAttr(`Usage captured ${formatDate(capturedAtMs)}`)}"` : "";
 
-  return `<section class="usage" title="Usage captured ${escapeAttr(formatDate(scan.usage.capturedAt))}">
-    ${renderUsageWindow("5h usage", scan.usage.primary)}
-    ${renderUsageWindow("7d usage", scan.usage.secondary)}
-    <div class="usage-actions">${disabledCheckButton}</div>
+  return `<section class="usage"${titleAttr}>
+    ${renderUsageWindow("5h usage", primary)}
+    ${renderUsageWindow("7d usage", secondary)}
+    <div class="usage-actions">${checkButton}</div>
   </section>`;
 }
 
-function renderUsageWindow(label: string, usage: NonNullable<AgentScan["usage"]>["primary"]): string {
+type CombinedUsageWindow = { usedPercent: number; resetsAt?: number };
+
+function combineCodexUsageWindow(
+  manual: { percent: number | undefined; resetsAt: number | undefined } | undefined,
+  transcript: { usedPercent: number; resetsAt?: number } | undefined
+): CombinedUsageWindow | undefined {
+  const usedPercent = manual?.percent ?? transcript?.usedPercent;
+  if (usedPercent === undefined) {
+    return undefined;
+  }
+
+  return {
+    usedPercent,
+    resetsAt: manual?.resetsAt ?? transcript?.resetsAt
+  };
+}
+
+function renderUsageWindow(label: string, usage: CombinedUsageWindow | undefined): string {
   if (!usage) {
     return `<div class="usage-window">
       <div class="usage-label"><strong>${escapeHtml(label)}</strong><span>unavailable</span></div>
@@ -1794,6 +1862,8 @@ function formatFriendlyDateTime(ms: number): string {
   return `${month} ${day}, ${year}, ${hours}:${String(minutes).padStart(2, "0")} ${meridiem}`;
 }
 
+const MONTH_ABBREVIATIONS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+
 // Claude's "/usage" CLI output gives resets as free text like "Jul 11, 8:59pm (America/New_York)"
 // with no year and no seconds. Reparsing that into a real Date would require assuming a timezone,
 // which risks silently shifting the displayed time - so instead this only reformats the pieces the
@@ -1810,7 +1880,15 @@ function normalizeClaudeResetLabel(raw: string | undefined, referenceMs: number)
   }
 
   const [, month, day, hour, minute = "00", meridiem] = match;
-  const year = new Date(referenceMs).getFullYear();
+  const referenceDate = new Date(referenceMs);
+  const resetMonthIndex = MONTH_ABBREVIATIONS.indexOf(month.toLowerCase());
+  // Session/week windows only ever reset a few hours or days out, so the only way the reset's
+  // month can appear "earlier" than the reference month is a wrap into next year (e.g. checking
+  // on Dec 30 with a reset on Jan 2) - never a same-year rollback.
+  const year =
+    resetMonthIndex !== -1 && resetMonthIndex < referenceDate.getMonth()
+      ? referenceDate.getFullYear() + 1
+      : referenceDate.getFullYear();
   return `${month} ${day}, ${year}, ${hour}:${minute} ${meridiem.toUpperCase()}`;
 }
 
@@ -1875,6 +1953,25 @@ function formatCompactNumber(value: number): string {
 
 function formatPercent(value: number): string {
   return value < 1 && value > 0 ? `${value.toFixed(1)}%` : `${Math.round(value)}%`;
+}
+
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) {
+    return "unknown";
+  }
+
+  const totalSeconds = Math.round(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m ${seconds}s`;
+  }
+  return `${seconds}s`;
 }
 
 function escapeHtml(value: string): string {
