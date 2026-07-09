@@ -5,8 +5,10 @@
   "version": "0.0.1",
   "publisher": "everyhedron",
   "license": "MIT",
+  "icon": "media/icon.png",
   "files": [
     "out/**",
+    "media/icon.png",
     "README.md",
     "LICENSE",
     "package.json"

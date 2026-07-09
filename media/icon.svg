@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1c2128" />
+      <stop offset="100%" stop-color="#0d1117" />
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="128" height="128" rx="28" fill="url(#bg)" />
+
+  <g fill="none" stroke="#e6edf3" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+    <!-- antenna -->
+    <line x1="64" y1="22" x2="64" y2="36" />
+    <circle cx="64" cy="17" r="5" fill="#e6edf3" stroke="none" />
+
+    <!-- ears -->
+    <rect x="22" y="56" width="9" height="20" rx="4.5" />
+    <rect x="97" y="56" width="9" height="20" rx="4.5" />
+
+    <!-- head -->
+    <rect x="32" y="36" width="64" height="58" rx="18" />
+
+    <!-- mouth grille -->
+    <line x1="50" y1="80" x2="50" y2="86" />
+    <line x1="64" y1="80" x2="64" y2="86" />
+    <line x1="78" y1="80" x2="78" y2="86" />
+  </g>
+
+  <!-- eyes -->
+  <circle cx="50" cy="60" r="7.5" fill="#f0883e" />
+  <circle cx="78" cy="60" r="7.5" fill="#4493f8" />
+</svg>

@@ -861,9 +861,9 @@ function renderDashboard(
     .usage {
       border: 1px solid var(--border);
       border-radius: 8px;
-      display: grid;
+      display: flex;
+      flex-wrap: wrap;
       gap: 10px;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
       margin: 0 0 14px;
       padding: 10px;
     }
@@ -873,12 +873,7 @@ function renderDashboard(
       text-align: left;
     }
 
-    .claude-usage {
-      display: flex;
-      flex-wrap: wrap;
-    }
-
-    .claude-usage .usage-window {
+    .usage-window {
       flex: 1 1 220px;
     }
 
@@ -1727,10 +1722,11 @@ function renderClaudeUsageSection(usage: ClaudeUsageSummary | undefined, fetchin
     fetching ? "disabled" : ""
   }>${fetching ? "Checking..." : "Check usage"}</button>`;
   const titleAttr = usage?.checkedAtMs ? ` title="${escapeAttr(`Usage captured ${formatDate(usage.checkedAtMs)}`)}"` : "";
+  const referenceMs = usage?.checkedAtMs ?? Date.now();
 
   return `<section class="usage claude-usage"${titleAttr}>
-    ${renderClaudeUsageWindow("Session usage", usage?.sessionPercent, usage?.sessionResets)}
-    ${renderClaudeUsageWindow("Week usage", usage?.weekPercent, usage?.weekResets)}
+    ${renderClaudeUsageWindow("Session usage", usage?.sessionPercent, normalizeClaudeResetLabel(usage?.sessionResets, referenceMs))}
+    ${renderClaudeUsageWindow("Week usage", usage?.weekPercent, normalizeClaudeResetLabel(usage?.weekResets, referenceMs))}
     <div class="usage-actions">${refreshButton}</div>
   </section>`;
 }
@@ -1756,9 +1752,12 @@ function renderUsage(scan: AgentScan): string {
     return `<section class="usage empty">No usage data found in Codex transcripts.</section>`;
   }
 
+  const disabledCheckButton = `<button class="secondary" type="button" disabled title="Coming soon - manual usage checks for Codex aren't wired up yet">Check usage</button>`;
+
   return `<section class="usage" title="Usage captured ${escapeAttr(formatDate(scan.usage.capturedAt))}">
     ${renderUsageWindow("5h usage", scan.usage.primary)}
     ${renderUsageWindow("7d usage", scan.usage.secondary)}
+    <div class="usage-actions">${disabledCheckButton}</div>
   </section>`;
 }
 
@@ -1771,9 +1770,48 @@ function renderUsageWindow(label: string, usage: NonNullable<AgentScan["usage"]>
   }
 
   return `<div class="usage-window">
-    <div class="usage-label"><strong>${escapeHtml(label)}</strong><span>${Math.round(usage.usedPercent)}% · resets ${escapeHtml(formatUnixSeconds(usage.resetsAt))}</span></div>
+    <div class="usage-label"><strong>${escapeHtml(label)}</strong><span>${Math.round(usage.usedPercent)}% · resets ${escapeHtml(usage.resetsAt ? formatFriendlyDateTime(usage.resetsAt * 1000) : "unknown")}</span></div>
     <div class="usage-track"><div class="usage-fill" style="width: ${usage.usedPercent}%"></div></div>
   </div>`;
+}
+
+// Both cards render their "resets" date through this same formatter so that the two usage
+// sections read as one design language instead of Codex showing a locale date string
+// ("7/8/2026, 2:18:35 PM") next to Claude's raw CLI phrasing ("Jul 8, 6:39pm").
+function formatFriendlyDateTime(ms: number): string {
+  const date = new Date(ms);
+  if (!Number.isFinite(date.getTime())) {
+    return "unknown";
+  }
+
+  const month = date.toLocaleString(undefined, { month: "short" });
+  const day = date.getDate();
+  const year = date.getFullYear();
+  const hours24 = date.getHours();
+  const minutes = date.getMinutes();
+  const meridiem = hours24 >= 12 ? "PM" : "AM";
+  const hours = hours24 % 12 || 12;
+  return `${month} ${day}, ${year}, ${hours}:${String(minutes).padStart(2, "0")} ${meridiem}`;
+}
+
+// Claude's "/usage" CLI output gives resets as free text like "Jul 11, 8:59pm (America/New_York)"
+// with no year and no seconds. Reparsing that into a real Date would require assuming a timezone,
+// which risks silently shifting the displayed time - so instead this only reformats the pieces the
+// CLI already gave us (adding the year for context, dropping the parenthetical zone name) to match
+// formatFriendlyDateTime's shape. Falls back to the raw string if the CLI's phrasing ever changes.
+function normalizeClaudeResetLabel(raw: string | undefined, referenceMs: number): string | undefined {
+  if (!raw) {
+    return undefined;
+  }
+
+  const match = raw.match(/^([A-Za-z]{3})\w*\s+(\d{1,2}),?\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
+  if (!match) {
+    return raw;
+  }
+
+  const [, month, day, hour, minute = "00", meridiem] = match;
+  const year = new Date(referenceMs).getFullYear();
+  return `${month} ${day}, ${year}, ${hour}:${minute} ${meridiem.toUpperCase()}`;
 }
 
 function summaryTooltip(summary: AgentScan["summary"], timings?: AgentScan["timings"]): string {
@@ -1812,10 +1850,6 @@ function formatDate(value: string | number | undefined): string {
   }
 
   return date.toLocaleString();
-}
-
-function formatUnixSeconds(value: number | undefined): string {
-  return value ? formatDate(value * 1000) : "unknown";
 }
 
 function formatNumber(value: number): string {
