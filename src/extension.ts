@@ -170,7 +170,7 @@ class DoneNotifier {
         );
 
         if (choice === "Open Monitor") {
-          this.dashboard.open();
+          await this.dashboard.focus();
         }
 
         if (choice === "Open Agent") {
@@ -198,7 +198,7 @@ class DoneNotifier {
       );
 
       if (choice === "Open Monitor") {
-        this.dashboard.open();
+        await this.dashboard.focus();
       }
 
       if (choice === "Open Agent") {
@@ -223,7 +223,7 @@ class DoneNotifier {
         );
 
         if (choice === "Open Monitor") {
-          this.dashboard.open();
+          await this.dashboard.focus();
         }
 
         if (choice === "Open Agent") {

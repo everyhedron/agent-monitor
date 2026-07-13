@@ -2,7 +2,7 @@
   "name": "hedron-agent-monitor",
   "displayName": "Hedron Agent Monitor",
   "description": "VS Code dashboard for monitoring local Codex and Claude Code sessions.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "everyhedron",
   "license": "MIT",
   "icon": "media/icon.png",

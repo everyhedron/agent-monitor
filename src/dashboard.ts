@@ -90,6 +90,11 @@ export class Dashboard {
     this.attachPanel(panel);
   }
 
+  async focus(): Promise<void> {
+    this.open();
+    await vscode.commands.executeCommand("workbench.action.focusActiveEditorGroup");
+  }
+
   restore(panel: vscode.WebviewPanel): void {
     panel.webview.options = {
       enableScripts: true
@@ -193,21 +198,29 @@ export class Dashboard {
     }
 
     if (this.panel) {
-      this.panel.webview.html = renderDashboard(
-        scan,
-        this.getConfig(),
-        this.lastClaudeSessions,
-        {
-          codex: new Set(this.codexTerminals.keys()),
-          claude: new Set(this.claudeTerminals.keys())
-        },
-        this.claudeUsage,
-        this.claudeUsageFetching,
-        this.codexUsage,
-        this.codexUsageFetching
-      );
+      this.renderCurrent();
     }
     return scan;
+  }
+
+  private renderCurrent(): void {
+    if (!this.panel || !this.lastScan) {
+      return;
+    }
+
+    this.panel.webview.html = renderDashboard(
+      this.lastScan,
+      this.getConfig(),
+      this.lastClaudeSessions,
+      {
+        codex: new Set(this.codexTerminals.keys()),
+        claude: new Set(this.claudeTerminals.keys())
+      },
+      this.claudeUsage,
+      this.claudeUsageFetching,
+      this.codexUsage,
+      this.codexUsageFetching
+    );
   }
 
   restartTimer(): void {
@@ -466,8 +479,10 @@ export class Dashboard {
       const session = this.lastScan?.sessions.find((session) => session.id === sessionId);
       const contextPercent = computeContextPercent(session?.usage?.lastTokenUsage?.inputTokens);
       if (contextPercent === undefined || contextPercent > 0) {
-        this.pendingReviewCompactCodexIds.add(sessionId);
-        await this.sendCompact(sessionId);
+        const sent = await this.sendCompactIfTerminalOpen(sessionId);
+        if (sent) {
+          this.pendingReviewCompactCodexIds.add(sessionId);
+        }
       }
     }
     await this.refresh({ force: true });
@@ -479,8 +494,10 @@ export class Dashboard {
       const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
       const contextPercent = computeContextPercent(session?.usage?.contextTokens);
       if (contextPercent === undefined || contextPercent > 0) {
-        this.pendingReviewCompactClaudeIds.add(sessionId);
-        await this.sendClaudeCompact(sessionId);
+        const sent = await this.sendClaudeCompactIfTerminalOpen(sessionId);
+        if (sent) {
+          this.pendingReviewCompactClaudeIds.add(sessionId);
+        }
       }
     }
     await this.refresh({ force: true });
@@ -493,11 +510,35 @@ export class Dashboard {
     await this.sendCompactToTerminal(existingTerminal, terminalName, () => this.openAgent(sessionId));
   }
 
+  async sendCompactIfTerminalOpen(sessionId: string): Promise<boolean> {
+    const session = this.lastScan?.sessions.find((session) => session.id === sessionId);
+    const terminalName = terminalNameForSession(session?.name);
+    const existingTerminal = this.resolveTerminal(this.codexTerminals, sessionId, terminalName);
+    if (!existingTerminal) {
+      return false;
+    }
+
+    await this.sendCompactToTerminal(existingTerminal, terminalName);
+    return true;
+  }
+
   async sendClaudeCompact(sessionId: string): Promise<void> {
     const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
     const terminalName = claudeTerminalNameForSession(session?.name);
     const existingTerminal = this.resolveTerminal(this.claudeTerminals, sessionId, terminalName);
     await this.sendCompactToTerminal(existingTerminal, terminalName, () => this.openClaudeAgent(sessionId));
+  }
+
+  async sendClaudeCompactIfTerminalOpen(sessionId: string): Promise<boolean> {
+    const session = this.lastClaudeSessions.find((session) => session.id === sessionId);
+    const terminalName = claudeTerminalNameForSession(session?.name);
+    const existingTerminal = this.resolveTerminal(this.claudeTerminals, sessionId, terminalName);
+    if (!existingTerminal) {
+      return false;
+    }
+
+    await this.sendCompactToTerminal(existingTerminal, terminalName);
+    return true;
   }
 
   async refreshClaudeUsage(): Promise<void> {
@@ -539,7 +580,7 @@ export class Dashboard {
     }
 
     this.codexUsageFetching = true;
-    await this.refresh({ force: true });
+    this.renderCurrent();
 
     try {
       const usage = await fetchCodexUsage(this.getConfig().codexHome);
@@ -552,13 +593,13 @@ export class Dashboard {
       this.codexUsageFetching = false;
     }
 
-    await this.refresh({ force: true });
+    this.renderCurrent();
   }
 
   private async sendCompactToTerminal(
     existingTerminal: vscode.Terminal | undefined,
     terminalName: string,
-    openIfMissing: () => void
+    openIfMissing?: () => void
   ): Promise<void> {
     if (existingTerminal) {
       existingTerminal.show();
@@ -568,7 +609,9 @@ export class Dashboard {
       return;
     }
 
-    openIfMissing();
+    if (openIfMissing) {
+      openIfMissing();
+    }
     await vscode.env.clipboard.writeText("/compact");
     void vscode.window.showWarningMessage(`Auto compact failed for ${terminalName}. Paste /compact into the terminal manually.`);
   }
@@ -1787,46 +1830,56 @@ function renderClaudeUsageWindow(label: string, percent: number | undefined, res
 
 function renderUsage(scan: AgentScan, manualUsage: CodexUsageSummary | undefined, fetching: boolean): string {
   const primary = combineCodexUsageWindow(
-    manualUsage ? { percent: manualUsage.primaryPercent, resetsAt: manualUsage.primaryResetsAt } : undefined,
+    manualUsage ? { percent: manualUsage.primaryPercent, resetsAt: manualUsage.primaryResetsAt, capturedAtMs: manualUsage.checkedAtMs } : undefined,
     scan.usage?.primary
+      ? { ...scan.usage.primary, capturedAtMs: Date.parse(scan.usage.capturedAt) }
+      : undefined
   );
   const secondary = combineCodexUsageWindow(
-    manualUsage ? { percent: manualUsage.secondaryPercent, resetsAt: manualUsage.secondaryResetsAt } : undefined,
+    manualUsage ? { percent: manualUsage.secondaryPercent, resetsAt: manualUsage.secondaryResetsAt, capturedAtMs: manualUsage.checkedAtMs } : undefined,
     scan.usage?.secondary
+      ? { ...scan.usage.secondary, capturedAtMs: Date.parse(scan.usage.capturedAt) }
+      : undefined
   );
-
-  if (!primary && !secondary) {
-    return `<section class="usage empty">No usage data found in Codex transcripts.</section>`;
-  }
 
   const checkButton = `<button class="${fetching ? "secondary" : ""}" type="button" data-command="refreshCodexUsage" ${
     fetching ? "disabled" : ""
   }>${fetching ? "Checking..." : "Check usage"}</button>`;
-  const capturedAtMs = manualUsage?.checkedAtMs ?? (scan.usage ? Date.parse(scan.usage.capturedAt) : undefined);
+  const transcriptCapturedAtMs = scan.usage ? Date.parse(scan.usage.capturedAt) : undefined;
+  const capturedAtMs = latestTimestamp(manualUsage?.checkedAtMs, transcriptCapturedAtMs);
   const titleAttr = capturedAtMs !== undefined ? ` title="${escapeAttr(`Usage captured ${formatDate(capturedAtMs)}`)}"` : "";
+  const checkedText = manualUsage?.checkedAtMs ? `<span class="meta">checked ${escapeHtml(formatDate(manualUsage.checkedAtMs))}</span>` : "";
+  const emptyClass = !primary && !secondary ? " empty" : "";
 
-  return `<section class="usage"${titleAttr}>
+  return `<section class="usage${emptyClass}"${titleAttr}>
     ${renderUsageWindow("5h usage", primary)}
     ${renderUsageWindow("7d usage", secondary)}
-    <div class="usage-actions">${checkButton}</div>
+    <div class="usage-actions">${checkButton}${checkedText}</div>
   </section>`;
 }
 
 type CombinedUsageWindow = { usedPercent: number; resetsAt?: number };
 
 function combineCodexUsageWindow(
-  manual: { percent: number | undefined; resetsAt: number | undefined } | undefined,
-  transcript: { usedPercent: number; resetsAt?: number } | undefined
+  manual: { percent: number | undefined; resetsAt: number | undefined; capturedAtMs: number } | undefined,
+  transcript: { usedPercent: number; resetsAt?: number; capturedAtMs: number } | undefined
 ): CombinedUsageWindow | undefined {
-  const usedPercent = manual?.percent ?? transcript?.usedPercent;
-  if (usedPercent === undefined) {
-    return undefined;
-  }
+  const manualWindow =
+    manual?.percent !== undefined && Number.isFinite(manual.capturedAtMs)
+      ? { usedPercent: manual.percent, resetsAt: manual.resetsAt, capturedAtMs: manual.capturedAtMs }
+      : undefined;
+  const transcriptWindow =
+    transcript && Number.isFinite(transcript.capturedAtMs)
+      ? { usedPercent: transcript.usedPercent, resetsAt: transcript.resetsAt, capturedAtMs: transcript.capturedAtMs }
+      : undefined;
+  const latest =
+    manualWindow && transcriptWindow
+      ? manualWindow.capturedAtMs >= transcriptWindow.capturedAtMs
+        ? manualWindow
+        : transcriptWindow
+      : manualWindow ?? transcriptWindow;
 
-  return {
-    usedPercent,
-    resetsAt: manual?.resetsAt ?? transcript?.resetsAt
-  };
+  return latest ? { usedPercent: latest.usedPercent, resetsAt: latest.resetsAt } : undefined;
 }
 
 function renderUsageWindow(label: string, usage: CombinedUsageWindow | undefined): string {
@@ -1841,6 +1894,15 @@ function renderUsageWindow(label: string, usage: CombinedUsageWindow | undefined
     <div class="usage-label"><strong>${escapeHtml(label)}</strong><span>${Math.round(usage.usedPercent)}% · resets ${escapeHtml(usage.resetsAt ? formatFriendlyDateTime(usage.resetsAt * 1000) : "unknown")}</span></div>
     <div class="usage-track"><div class="usage-fill" style="width: ${usage.usedPercent}%"></div></div>
   </div>`;
+}
+
+function latestTimestamp(...timestamps: Array<number | undefined>): number | undefined {
+  const finiteTimestamps = timestamps.filter((timestamp): timestamp is number => timestamp !== undefined && Number.isFinite(timestamp));
+  if (finiteTimestamps.length === 0) {
+    return undefined;
+  }
+
+  return Math.max(...finiteTimestamps);
 }
 
 // Both cards render their "resets" date through this same formatter so that the two usage
