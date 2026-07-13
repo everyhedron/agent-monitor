@@ -1,4 +1,4 @@
-# Hedron Agent Monitor
+# Agent Monitor
 
 A VS Code dashboard for keeping track of local <strong>Codex</strong> and <strong>Claude Code</strong> sessions - what's running, what's requesting approval, and what's already reviewed. Run `Hedron Agent Monitor: Open Dashboard` or click the robot <picture><source media="(prefers-color-scheme: light)" srcset="media/hubot-light.png"><source media="(prefers-color-scheme: dark)" srcset="media/hubot-dark.png"><img alt="Hubot icon" src="media/hubot-light.png" width="18"></picture> icon in the status bar.
 
