@@ -6,25 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [0.0.4] - 2026-07-14
-
-### Fixed
-- Codex usage captured timestamps now appear only in the usage section hover text, not as visible inline UI.
-
-## [0.0.3] - 2026-07-14
-
-### Fixed
-- Codex live usage now maps returned windows by duration, so the current 7-day window updates the 7d usage card instead of leaving stale transcript data.
-- Codex usage reported timestamps now use the latest source timestamp in the same concise display format as usage reset labels.
-- Compact buttons now appear for already-open agent terminals even when VS Code appends suffix text to the terminal tab name.
-
-## [0.0.2] - 2026-07-13
+## [0.0.2] - 2026-07-14
 
 ### Fixed
 - Auto-compact on review now only sends `/compact` when the matching agent terminal is already open.
+- Codex and Claude Check usage buttons now enter their busy state immediately in the webview before backend refresh work starts.
 - Codex Check usage now remains visible without transcript usage and shows the latest manual checked timestamp.
 - Codex Check usage now updates its checking/result display without waiting for a full dashboard refresh.
 - Codex usage cards now prefer the freshest source, so newer transcript usage can replace an older manual check.
+- Codex live usage now maps returned windows by duration, so the current 7-day window updates the 7d usage card instead of leaving stale transcript data.
+- Codex usage captured timestamps now appear only in the usage section hover text, not as visible inline UI.
+- Compact buttons now appear for already-open agent terminals even when VS Code appends suffix text to the terminal tab name.
 - Notification Open Monitor actions now explicitly focus the existing dashboard panel.
 - Confirmed archived Codex deletion removes the deleted session from `session_index.jsonl`.
 
@@ -43,7 +35,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Year-rollover bug in Claude usage reset-date labels near the end of December.
 - Various races around compact-vs-reviewed state, terminal lookup order, and orphaned Codex sessions.
 
-[Unreleased]: https://github.com/everyhedron/agent-monitor/compare/v0.0.4...main
-[0.0.4]: https://github.com/everyhedron/agent-monitor/releases/tag/v0.0.4
-[0.0.3]: https://github.com/everyhedron/agent-monitor/releases/tag/v0.0.3
+[Unreleased]: https://github.com/everyhedron/agent-monitor/compare/v0.0.2...main
 [0.0.2]: https://github.com/everyhedron/agent-monitor/releases/tag/v0.0.2

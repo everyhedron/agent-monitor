@@ -1421,6 +1421,16 @@ function renderDashboard(
       }
     }
 
+    function setUsageButtonBusy(button) {
+      if (!button || button.disabled) {
+        return;
+      }
+      button.dataset.originalLabel = button.textContent;
+      button.textContent = "Checking...";
+      button.classList.add("secondary");
+      button.disabled = true;
+    }
+
     function requestRefresh(options = {}) {
       if (refreshing) {
         return;
@@ -1494,6 +1504,10 @@ function renderDashboard(
       if (commandElement.dataset.command === "refresh") {
         requestRefresh({ manual: true });
         return;
+      }
+
+      if (commandElement.dataset.command === "refreshCodexUsage" || commandElement.dataset.command === "refreshClaudeUsage") {
+        setUsageButtonBusy(commandElement);
       }
 
       vscode.postMessage({
