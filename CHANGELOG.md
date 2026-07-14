@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.0.4] - 2026-07-14
+
+### Fixed
+- Codex usage captured timestamps now appear only in the usage section hover text, not as visible inline UI.
+
 ## [0.0.3] - 2026-07-14
 
 ### Fixed
@@ -38,6 +43,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Year-rollover bug in Claude usage reset-date labels near the end of December.
 - Various races around compact-vs-reviewed state, terminal lookup order, and orphaned Codex sessions.
 
-[Unreleased]: https://github.com/everyhedron/agent-monitor/compare/v0.0.3...main
+[Unreleased]: https://github.com/everyhedron/agent-monitor/compare/v0.0.4...main
+[0.0.4]: https://github.com/everyhedron/agent-monitor/releases/tag/v0.0.4
 [0.0.3]: https://github.com/everyhedron/agent-monitor/releases/tag/v0.0.3
 [0.0.2]: https://github.com/everyhedron/agent-monitor/releases/tag/v0.0.2

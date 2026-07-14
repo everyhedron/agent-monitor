@@ -1874,13 +1874,12 @@ function renderUsage(scan: AgentScan, manualUsage: CodexUsageSummary | undefined
   const capturedAtMs = latestTimestamp(manualUsage?.checkedAtMs, transcriptCapturedAtMs);
   const capturedText = capturedAtMs !== undefined ? formatFriendlyDateTime(capturedAtMs) : undefined;
   const titleAttr = capturedText !== undefined ? ` title="${escapeAttr(`Usage captured ${capturedText}`)}"` : "";
-  const checkedText = capturedText ? `<span class="meta">reported ${escapeHtml(capturedText)}</span>` : "";
   const emptyClass = !primary && !secondary ? " empty" : "";
 
   return `<section class="usage${emptyClass}"${titleAttr}>
     ${renderUsageWindow("5h usage", primary)}
     ${renderUsageWindow("7d usage", secondary)}
-    <div class="usage-actions">${checkButton}${checkedText}</div>
+    <div class="usage-actions">${checkButton}</div>
   </section>`;
 }
 
