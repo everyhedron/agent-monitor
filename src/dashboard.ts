@@ -212,15 +212,34 @@ export class Dashboard {
       this.lastScan,
       this.getConfig(),
       this.lastClaudeSessions,
-      {
-        codex: new Set(this.codexTerminals.keys()),
-        claude: new Set(this.claudeTerminals.keys())
-      },
+      this.getOpenTerminalSessionIds(),
       this.claudeUsage,
       this.claudeUsageFetching,
       this.codexUsage,
       this.codexUsageFetching
     );
+  }
+
+  private getOpenTerminalSessionIds(): { codex: Set<string>; claude: Set<string> } {
+    const codex = new Set(this.codexTerminals.keys());
+    for (const session of this.lastScan?.sessions ?? []) {
+      const terminal = findTerminalByExpectedName(terminalNameForSession(session.name));
+      if (terminal) {
+        this.codexTerminals.set(session.id, terminal);
+        codex.add(session.id);
+      }
+    }
+
+    const claude = new Set(this.claudeTerminals.keys());
+    for (const session of this.lastClaudeSessions) {
+      const terminal = findTerminalByExpectedName(claudeTerminalNameForSession(session.name));
+      if (terminal) {
+        this.claudeTerminals.set(session.id, terminal);
+        claude.add(session.id);
+      }
+    }
+
+    return { codex, claude };
   }
 
   restartTimer(): void {
@@ -378,7 +397,7 @@ export class Dashboard {
   // by-name lookups work again; every caller already calls `.show()` on the result right after,
   // so this doesn't steal focus beyond what the caller was already about to do.
   private resolveTerminal(map: Map<string, vscode.Terminal>, sessionId: string, expectedName: string): vscode.Terminal | undefined {
-    const byName = vscode.window.terminals.find((terminal) => terminal.name === expectedName);
+    const byName = findTerminalByExpectedName(expectedName);
     if (byName) {
       map.set(sessionId, byName);
       return byName;
@@ -1514,6 +1533,12 @@ function claudeTerminalNameForSession(sessionName: string | undefined): string {
   return `${sessionName?.trim() || "Agent"} | Claude`;
 }
 
+function findTerminalByExpectedName(expectedName: string): vscode.Terminal | undefined {
+  return vscode.window.terminals.find(
+    (terminal) => terminal.name === expectedName || terminal.name.startsWith(`${expectedName} `)
+  );
+}
+
 function combineSummaries(summary: AgentScan["summary"], claudeSessions: ClaudeSession[]): AgentScan["summary"] {
   const running = claudeSessions.filter((session) => session.status === "running").length;
   const needsApproval = claudeSessions.filter((session) => session.status === "needs-input").length;
@@ -1847,8 +1872,9 @@ function renderUsage(scan: AgentScan, manualUsage: CodexUsageSummary | undefined
   }>${fetching ? "Checking..." : "Check usage"}</button>`;
   const transcriptCapturedAtMs = scan.usage ? Date.parse(scan.usage.capturedAt) : undefined;
   const capturedAtMs = latestTimestamp(manualUsage?.checkedAtMs, transcriptCapturedAtMs);
-  const titleAttr = capturedAtMs !== undefined ? ` title="${escapeAttr(`Usage captured ${formatDate(capturedAtMs)}`)}"` : "";
-  const checkedText = manualUsage?.checkedAtMs ? `<span class="meta">checked ${escapeHtml(formatDate(manualUsage.checkedAtMs))}</span>` : "";
+  const capturedText = capturedAtMs !== undefined ? formatFriendlyDateTime(capturedAtMs) : undefined;
+  const titleAttr = capturedText !== undefined ? ` title="${escapeAttr(`Usage captured ${capturedText}`)}"` : "";
+  const checkedText = capturedText ? `<span class="meta">reported ${escapeHtml(capturedText)}</span>` : "";
   const emptyClass = !primary && !secondary ? " empty" : "";
 
   return `<section class="usage${emptyClass}"${titleAttr}>

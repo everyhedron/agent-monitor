@@ -18,9 +18,21 @@ type CodexAuthFile = {
 type CodexUsageResponse = {
   plan_type?: string;
   rate_limit?: {
-    primary_window?: { used_percent?: number; reset_at?: number };
-    secondary_window?: { used_percent?: number; reset_at?: number };
+    primary_window?: CodexUsageWindowResponse | null;
+    secondary_window?: CodexUsageWindowResponse | null;
   };
+};
+
+type CodexUsageWindowResponse = {
+  used_percent?: number;
+  reset_at?: number;
+  limit_window_seconds?: number;
+};
+
+type ParsedCodexUsageWindow = {
+  percent?: number;
+  resetsAt?: number;
+  windowSeconds?: number;
 };
 
 // Codex has no locally-cached "current" usage snapshot the way transcripts give us historical
@@ -56,14 +68,38 @@ export async function fetchCodexUsage(codexHome: string): Promise<CodexManualUsa
   }
 
   const body = (await response.json()) as CodexUsageResponse;
+  const primaryWindow = parseWindow(body.rate_limit?.primary_window);
+  const secondaryWindow = parseWindow(body.rate_limit?.secondary_window);
+  const windows = [primaryWindow, secondaryWindow].filter((window): window is ParsedCodexUsageWindow => window !== undefined);
+  const fiveHourWindow = findWindowByDuration(windows, 5 * 60 * 60) ?? (primaryWindow?.windowSeconds === undefined ? primaryWindow : undefined);
+  const sevenDayWindow = findWindowByDuration(windows, 7 * 24 * 60 * 60) ?? (secondaryWindow?.windowSeconds === undefined ? secondaryWindow : undefined);
 
   return {
     planType: body.plan_type,
-    primaryPercent: body.rate_limit?.primary_window?.used_percent,
-    primaryResetsAt: body.rate_limit?.primary_window?.reset_at,
-    secondaryPercent: body.rate_limit?.secondary_window?.used_percent,
-    secondaryResetsAt: body.rate_limit?.secondary_window?.reset_at
+    primaryPercent: fiveHourWindow?.percent,
+    primaryResetsAt: fiveHourWindow?.resetsAt,
+    secondaryPercent: sevenDayWindow?.percent,
+    secondaryResetsAt: sevenDayWindow?.resetsAt
   };
+}
+
+function parseWindow(window: CodexUsageWindowResponse | null | undefined): ParsedCodexUsageWindow | undefined {
+  if (!window) {
+    return undefined;
+  }
+
+  return {
+    percent: typeof window.used_percent === "number" ? window.used_percent : undefined,
+    resetsAt: typeof window.reset_at === "number" ? window.reset_at : undefined,
+    windowSeconds: typeof window.limit_window_seconds === "number" ? window.limit_window_seconds : undefined
+  };
+}
+
+function findWindowByDuration(
+  windows: ParsedCodexUsageWindow[],
+  targetSeconds: number
+): ParsedCodexUsageWindow | undefined {
+  return windows.find((window) => window.windowSeconds !== undefined && Math.abs(window.windowSeconds - targetSeconds) <= 60);
 }
 
 function errorMessage(error: unknown): string {
