@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 - Auto-compact on review now only sends `/compact` when the matching agent terminal is already open.
 - Codex and Claude Check usage buttons now enter their busy state immediately in the webview before backend refresh work starts.
+- Codex and Claude transcript scans now cache parsed card data in memory and only parse newly appended transcript lines when files change.
 - Codex Check usage now remains visible without transcript usage and shows the latest manual checked timestamp.
 - Codex Check usage now updates its checking/result display without waiting for a full dashboard refresh.
 - Codex usage cards now prefer the freshest source, so newer transcript usage can replace an older manual check.

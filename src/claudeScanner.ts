@@ -1,5 +1,7 @@
+import { createReadStream } from "fs";
 import * as fs from "fs/promises";
 import * as path from "path";
+import * as readline from "readline";
 import type { ReviewMap } from "./reviewState";
 
 export type ClaudeSessionStatus = "running" | "needs-input" | "idle" | "reviewed" | "archived";
@@ -132,46 +134,73 @@ export async function findLatestClaudeUsageSnapshot(claudeHome: string): Promise
 
   let latest: ClaudeUsageSnapshot | undefined;
 
-  await Promise.all(
-    files.map(async (file) => {
-      let content: string;
+  await Promise.all(files.map(async (file) => readClaudeUsageFile(file)));
+
+  for (const file of files) {
+    const usage = claudeUsageCache.get(file)?.latest;
+    if (usage && (!latest || usage.checkedAtMs > latest.checkedAtMs)) {
+      latest = usage;
+    }
+  }
+
+  return latest;
+}
+
+async function readClaudeUsageFile(file: string): Promise<void> {
+  let stat: Awaited<ReturnType<typeof fs.stat>>;
+  try {
+    stat = await fs.stat(file);
+  } catch {
+    claudeUsageCache.delete(file);
+    return;
+  }
+
+  const cached = claudeUsageCache.get(file);
+  const size = Number(stat.size);
+  const mtimeMs = Number(stat.mtimeMs);
+  if (cached && cached.size === size && cached.mtimeMs === mtimeMs) {
+    return;
+  }
+
+  const state =
+    cached && size >= cached.processedBytes
+      ? cached
+      : { size: 0, mtimeMs: 0, processedBytes: 0, latest: undefined };
+  const startOffset = state.processedBytes;
+
+  try {
+    state.processedBytes = await processNewCompleteLines(file, startOffset, size, (line) => {
+      if (!line.includes("local_command")) {
+        return;
+      }
+
+      let parsed: ClaudeTranscriptLine & { timestamp?: string };
       try {
-        content = await fs.readFile(file, "utf8");
+        parsed = JSON.parse(line);
       } catch {
         return;
       }
 
-      for (const line of content.split("\n")) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.includes("local_command")) {
-          continue;
-        }
-
-        let parsed: ClaudeTranscriptLine & { timestamp?: string };
-        try {
-          parsed = JSON.parse(trimmed);
-        } catch {
-          continue;
-        }
-
-        if (parsed.type !== "system" || parsed.subtype !== "local_command" || !parsed.content) {
-          continue;
-        }
-
-        const usage = parseClaudeUsageText(parsed.content);
-        const checkedAtMs = parsed.timestamp ? Date.parse(parsed.timestamp) : NaN;
-        if (!usage || !Number.isFinite(checkedAtMs)) {
-          continue;
-        }
-
-        if (!latest || checkedAtMs > latest.checkedAtMs) {
-          latest = { ...usage, checkedAtMs };
-        }
+      if (parsed.type !== "system" || parsed.subtype !== "local_command" || !parsed.content) {
+        return;
       }
-    })
-  );
 
-  return latest;
+      const usage = parseClaudeUsageText(parsed.content);
+      const checkedAtMs = parsed.timestamp ? Date.parse(parsed.timestamp) : NaN;
+      if (!usage || !Number.isFinite(checkedAtMs)) {
+        return;
+      }
+
+      if (!state.latest || checkedAtMs > state.latest.checkedAtMs) {
+        state.latest = { ...usage, checkedAtMs };
+      }
+    });
+    state.size = size;
+    state.mtimeMs = mtimeMs;
+    claudeUsageCache.set(file, state);
+  } catch {
+    claudeUsageCache.delete(file);
+  }
 }
 
 export async function archiveClaudeTranscript(claudeHome: string, transcriptPath: string): Promise<string> {
@@ -291,6 +320,39 @@ type ClaudeTranscriptLine = {
   compactMetadata?: { postTokens?: number };
 };
 
+type CachedClaudeSession = {
+  path: string;
+  archived: boolean;
+  size: number;
+  mtimeMs: number;
+  processedBytes: number;
+  sessionId: string;
+  customTitle?: string;
+  agentName?: string;
+  aiTitle?: string;
+  slug?: string;
+  lastUserMessage?: string;
+  lastMessage?: string;
+  totalTokens: number;
+  lastRunTokens: number;
+  contextTokens: number;
+  hasUsage: boolean;
+  hasAssistantMessage: boolean;
+  hasUsageLocalCommand: boolean;
+  lastRunStartedAtMs?: number;
+  lastRunFinishedAtMs?: number;
+};
+
+type CachedClaudeUsageFile = {
+  size: number;
+  mtimeMs: number;
+  processedBytes: number;
+  latest?: ClaudeUsageSnapshot;
+};
+
+const claudeSessionCache = new Map<string, CachedClaudeSession>();
+const claudeUsageCache = new Map<string, CachedClaudeUsageFile>();
+
 async function readClaudeSession(
   transcriptPath: string,
   liveStatus: Map<string, ClaudeSessionStatus>,
@@ -298,135 +360,71 @@ async function readClaudeSession(
   reviewed: ReviewMap
 ): Promise<ClaudeSession | undefined> {
   let stat: Awaited<ReturnType<typeof fs.stat>>;
-  let content: string;
   try {
-    [stat, content] = await Promise.all([fs.stat(transcriptPath), fs.readFile(transcriptPath, "utf8")]);
+    stat = await fs.stat(transcriptPath);
   } catch {
+    claudeSessionCache.delete(transcriptPath);
     return undefined;
   }
 
-  let sessionId = path.basename(transcriptPath, ".jsonl");
-  let customTitle: string | undefined;
-  let agentName: string | undefined;
-  let aiTitle: string | undefined;
-  let slug: string | undefined;
-  let lastUserMessage: string | undefined;
-  let lastMessage: string | undefined;
-  let totalTokens = 0;
-  let lastRunTokens = 0;
-  let contextTokens = 0;
-  let hasUsage = false;
-  let hasAssistantMessage = false;
-  let hasUsageLocalCommand = false;
-  let lastRunStartedAtMs: number | undefined;
-  let lastRunFinishedAtMs: number | undefined;
+  const cached = claudeSessionCache.get(transcriptPath);
+  const size = Number(stat.size);
+  const mtimeMs = Number(stat.mtimeMs);
+  const shouldReuse = cached && cached.archived === archived && cached.size === size && cached.mtimeMs === mtimeMs;
+  const canAppend = cached && cached.archived === archived && size >= cached.processedBytes;
+  const state = shouldReuse
+    ? cached
+    : canAppend
+    ? cached
+    : createClaudeSessionCacheEntry(transcriptPath, archived);
 
-  for (const line of content.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) {
-      continue;
-    }
-
-    let parsed: ClaudeTranscriptLine;
+  if (!shouldReuse) {
     try {
-      parsed = JSON.parse(trimmed) as ClaudeTranscriptLine;
-    } catch {
-      continue;
-    }
-
-    if (parsed.sessionId) {
-      sessionId = parsed.sessionId;
-    }
-
-    if (parsed.type === "custom-title" && parsed.customTitle) {
-      customTitle = parsed.customTitle;
-    }
-
-    if (parsed.type === "agent-name" && parsed.agentName) {
-      agentName = parsed.agentName;
-    }
-
-    if (parsed.type === "ai-title" && parsed.aiTitle) {
-      aiTitle = parsed.aiTitle;
-    }
-
-    if (parsed.type === "system" && parsed.slug) {
-      slug = parsed.slug;
-    }
-
-    if (parsed.type === "system" && parsed.subtype === "compact_boundary" && parsed.compactMetadata?.postTokens !== undefined) {
-      // Compaction isn't a new user turn, so it shouldn't reset lastRunTokens - only contextTokens
-      // actually changes here.
-      contextTokens = parsed.compactMetadata.postTokens;
-      hasUsage = true;
-    }
-
-    if (parsed.type === "system" && parsed.subtype === "local_command" && parsed.content && parseClaudeUsageText(parsed.content)) {
-      hasUsageLocalCommand = true;
-    }
-
-    if (parsed.type === "user" && parsed.message?.role === "user" && !parsed.isMeta) {
-      const text = extractText(parsed.message.content);
-      if (text && !isInjectedArtifact(text)) {
-        const skillCommand = parseSkillLaunchMessage(text);
-        if (skillCommand) {
-          lastUserMessage = skillCommand;
-          lastRunTokens = 0;
-          lastRunStartedAtMs = parseTime(parsed.timestamp);
-          lastRunFinishedAtMs = undefined;
-        } else {
-          // A bare slash command like "/compact" is still worth showing as the last user message
-          // (it tells you a compaction just happened), but it isn't a new unit of work, so it
-          // shouldn't reset the last-run token count or the last-run duration clock.
-          lastUserMessage = text;
-          if (!isSlashCommand(text)) {
-            lastRunTokens = 0;
-            lastRunStartedAtMs = parseTime(parsed.timestamp);
-            lastRunFinishedAtMs = undefined;
-          }
+      state.processedBytes = await processNewCompleteLines(transcriptPath, state.processedBytes, size, (line) => {
+        try {
+          applyClaudeTranscriptLine(state, JSON.parse(line) as ClaudeTranscriptLine);
+        } catch {
+          // Ignore malformed or partially written lines for this scan.
         }
-      }
-    } else if (parsed.type === "user" && parsed.message?.role === "user" && parsed.isMeta) {
-      // A project/user *skill* invocation (e.g. "/todo-runner") injects its instructions as an
-      // isMeta line prefixed with this preamble, distinct from a built-in local command like
-      // "/compact" or "/usage" (which never produces this preamble). Unlike a built-in command,
-      // a skill invocation is genuine new work, so display the command and reset the last-run
-      // counters while still hiding the injected skill body.
-      const text = extractText(parsed.message.content);
-      const skillCommand = text ? parseSkillInvocationCommand(text) : undefined;
-      if (skillCommand) {
-        lastUserMessage = skillCommand;
-        lastRunTokens = 0;
-        lastRunStartedAtMs = parseTime(parsed.timestamp);
-        lastRunFinishedAtMs = undefined;
-      }
+      });
+    } catch {
+      claudeSessionCache.delete(transcriptPath);
+      return undefined;
     }
-
-    if (parsed.type === "assistant" && parsed.message?.role === "assistant" && parsed.message.model !== "<synthetic>") {
-      // The CLI emits a synthetic "No response requested." assistant turn for queued local
-      // commands (e.g. a queued "/usage" or "/config") that don't actually invoke the model -
-      // marked by `message.model === "<synthetic>"`. Treating that as a real assistant turn would
-      // both defeat the usage-probe-hiding check below and clobber lastMessage with meaningless
-      // filler text.
-      hasAssistantMessage = true;
-      lastRunFinishedAtMs = parseTime(parsed.timestamp) ?? lastRunFinishedAtMs;
-      const text = extractText(parsed.message.content);
-      if (text) {
-        lastMessage = text;
-      }
-
-      const usage = parsed.message.usage;
-      if (usage) {
-        hasUsage = true;
-        const turnTokens = (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + (usage.output_tokens ?? 0);
-        totalTokens += turnTokens;
-        lastRunTokens += turnTokens;
-        contextTokens = (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0);
-      }
-    }
+    state.size = size;
+    state.mtimeMs = mtimeMs;
+    state.archived = archived;
+    claudeSessionCache.set(transcriptPath, state);
   }
 
-  if (hasUsageLocalCommand && !hasAssistantMessage) {
+  return finalizeClaudeSession(state, stat, archived, liveStatus, reviewed);
+}
+
+function createClaudeSessionCacheEntry(transcriptPath: string, archived: boolean): CachedClaudeSession {
+  return {
+    path: transcriptPath,
+    archived,
+    size: 0,
+    mtimeMs: 0,
+    processedBytes: 0,
+    sessionId: path.basename(transcriptPath, ".jsonl"),
+    totalTokens: 0,
+    lastRunTokens: 0,
+    contextTokens: 0,
+    hasUsage: false,
+    hasAssistantMessage: false,
+    hasUsageLocalCommand: false
+  };
+}
+
+function finalizeClaudeSession(
+  state: CachedClaudeSession,
+  stat: Awaited<ReturnType<typeof fs.stat>>,
+  archived: boolean,
+  liveStatus: Map<string, ClaudeSessionStatus>,
+  reviewed: ReviewMap
+): ClaudeSession | undefined {
+  if (state.hasUsageLocalCommand && !state.hasAssistantMessage) {
     // A "/usage" probe session (run interactively, or via "claude -p /usage") - hidden from the
     // dashboard, but left on disk so a later usage check can resume it instead of spawning a
     // fresh session every time.
@@ -434,12 +432,14 @@ async function readClaudeSession(
   }
 
   const lastRunDurationMs =
-    lastRunStartedAtMs !== undefined && lastRunFinishedAtMs !== undefined && lastRunFinishedAtMs >= lastRunStartedAtMs
-      ? lastRunFinishedAtMs - lastRunStartedAtMs
+    state.lastRunStartedAtMs !== undefined &&
+    state.lastRunFinishedAtMs !== undefined &&
+    state.lastRunFinishedAtMs >= state.lastRunStartedAtMs
+      ? state.lastRunFinishedAtMs - state.lastRunStartedAtMs
       : undefined;
-  const nameIsAiGenerated = !customTitle && !agentName && !!aiTitle;
-  const reviewedAt = reviewed[sessionId];
-  const liveOrIdleStatus = liveStatus.get(sessionId) ?? "idle";
+  const nameIsAiGenerated = !state.customTitle && !state.agentName && !!state.aiTitle;
+  const reviewedAt = reviewed[state.sessionId];
+  const liveOrIdleStatus = liveStatus.get(state.sessionId) ?? "idle";
   const status: ClaudeSessionStatus = archived
     ? "archived"
     : liveOrIdleStatus === "idle" && reviewedAt
@@ -447,18 +447,98 @@ async function readClaudeSession(
     : liveOrIdleStatus;
 
   return {
-    id: sessionId,
-    name: customTitle || agentName || aiTitle || slug || sessionId,
+    id: state.sessionId,
+    name: state.customTitle || state.agentName || state.aiTitle || state.slug || state.sessionId,
     nameIsAiGenerated,
     status,
-    updatedAtMs: stat.mtimeMs,
-    transcriptPath,
-    lastUserMessage,
-    lastMessage,
-    usage: hasUsage ? { totalTokens, lastRunTokens, contextTokens } : undefined,
+    updatedAtMs: Number(stat.mtimeMs),
+    transcriptPath: state.path,
+    lastUserMessage: state.lastUserMessage,
+    lastMessage: state.lastMessage,
+    usage: state.hasUsage
+      ? { totalTokens: state.totalTokens, lastRunTokens: state.lastRunTokens, contextTokens: state.contextTokens }
+      : undefined,
     lastRunDurationMs,
     reviewedAt
   };
+}
+
+function applyClaudeTranscriptLine(state: CachedClaudeSession, parsed: ClaudeTranscriptLine): void {
+  if (parsed.sessionId) {
+    state.sessionId = parsed.sessionId;
+  }
+
+  if (parsed.type === "custom-title" && parsed.customTitle) {
+    state.customTitle = parsed.customTitle;
+  }
+
+  if (parsed.type === "agent-name" && parsed.agentName) {
+    state.agentName = parsed.agentName;
+  }
+
+  if (parsed.type === "ai-title" && parsed.aiTitle) {
+    state.aiTitle = parsed.aiTitle;
+  }
+
+  if (parsed.type === "system" && parsed.slug) {
+    state.slug = parsed.slug;
+  }
+
+  if (parsed.type === "system" && parsed.subtype === "compact_boundary" && parsed.compactMetadata?.postTokens !== undefined) {
+    state.contextTokens = parsed.compactMetadata.postTokens;
+    state.hasUsage = true;
+  }
+
+  if (parsed.type === "system" && parsed.subtype === "local_command" && parsed.content && parseClaudeUsageText(parsed.content)) {
+    state.hasUsageLocalCommand = true;
+  }
+
+  if (parsed.type === "user" && parsed.message?.role === "user" && !parsed.isMeta) {
+    const text = extractText(parsed.message.content);
+    if (text && !isInjectedArtifact(text)) {
+      const skillCommand = parseSkillLaunchMessage(text);
+      if (skillCommand) {
+        state.lastUserMessage = skillCommand;
+        state.lastRunTokens = 0;
+        state.lastRunStartedAtMs = parseTime(parsed.timestamp);
+        state.lastRunFinishedAtMs = undefined;
+      } else {
+        state.lastUserMessage = text;
+        if (!isSlashCommand(text)) {
+          state.lastRunTokens = 0;
+          state.lastRunStartedAtMs = parseTime(parsed.timestamp);
+          state.lastRunFinishedAtMs = undefined;
+        }
+      }
+    }
+  } else if (parsed.type === "user" && parsed.message?.role === "user" && parsed.isMeta) {
+    const text = extractText(parsed.message.content);
+    const skillCommand = text ? parseSkillInvocationCommand(text) : undefined;
+    if (skillCommand) {
+      state.lastUserMessage = skillCommand;
+      state.lastRunTokens = 0;
+      state.lastRunStartedAtMs = parseTime(parsed.timestamp);
+      state.lastRunFinishedAtMs = undefined;
+    }
+  }
+
+  if (parsed.type === "assistant" && parsed.message?.role === "assistant" && parsed.message.model !== "<synthetic>") {
+    state.hasAssistantMessage = true;
+    state.lastRunFinishedAtMs = parseTime(parsed.timestamp) ?? state.lastRunFinishedAtMs;
+    const text = extractText(parsed.message.content);
+    if (text) {
+      state.lastMessage = text;
+    }
+
+    const usage = parsed.message.usage;
+    if (usage) {
+      state.hasUsage = true;
+      const turnTokens = (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + (usage.output_tokens ?? 0);
+      state.totalTokens += turnTokens;
+      state.lastRunTokens += turnTokens;
+      state.contextTokens = (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0);
+    }
+  }
 }
 
 function parseTime(value: string | undefined): number | undefined {
@@ -523,4 +603,26 @@ function extractText(content: unknown): string | undefined {
   }
 
   return undefined;
+}
+
+async function processNewCompleteLines(
+  filePath: string,
+  startOffset: number,
+  fileSize: number,
+  onLine: (line: string) => void
+): Promise<number> {
+  if (startOffset >= fileSize) {
+    return startOffset;
+  }
+
+  let processedBytes = startOffset;
+  const stream = createReadStream(filePath, { encoding: "utf8", start: startOffset, end: fileSize - 1 });
+  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+
+  for await (const line of lines) {
+    onLine(line);
+    processedBytes += Buffer.byteLength(line) + 1;
+  }
+
+  return Math.min(processedBytes, fileSize);
 }

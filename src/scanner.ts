@@ -1,6 +1,8 @@
 import { execFile } from "child_process";
+import { createReadStream } from "fs";
 import * as fs from "fs/promises";
 import * as path from "path";
+import * as readline from "readline";
 import { promisify } from "util";
 import type { AgentMonitorConfig } from "./config";
 import type { ReviewMap } from "./reviewState";
@@ -42,6 +44,43 @@ type TranscriptInfo = {
   latestUserAt?: string;
   latestAbortAt?: string;
 };
+
+type CachedTranscriptInfo = TranscriptInfo & {
+  size: number;
+  processedBytes: number;
+  lastCompletionMs: number;
+  latestUserMs: number;
+  latestAbortMs: number;
+  previousUsage?: AgentUsage;
+  userTurnBaselineUsage?: AgentUsage;
+  pendingApprovalCalls: Map<string, number>;
+  pendingApprovalAt?: string;
+  approvalReasonCandidate?: string;
+  approvalCommandCandidate?: string;
+};
+
+type CodexTranscriptLine = {
+  timestamp?: string;
+  type?: string;
+  payload?: {
+    id?: string;
+    session_id?: string;
+    thread_name?: string;
+    type?: string;
+    role?: string;
+    message?: string;
+    content?: Array<{ type?: string; text?: string }>;
+    last_agent_message?: string;
+    completed_at?: number;
+    name?: string;
+    arguments?: string;
+    call_id?: string;
+    rate_limits?: unknown;
+    info?: unknown;
+  };
+};
+
+const transcriptCache = new Map<string, CachedTranscriptInfo>();
 
 export async function scanAgents(config: AgentMonitorConfig, reviewed: ReviewMap): Promise<AgentScan> {
   const diagnostics: AgentScanDiagnostic[] = [];
@@ -234,9 +273,8 @@ async function readTranscriptInfo(
   diagnostics: AgentScanDiagnostic[]
 ): Promise<TranscriptInfo> {
   let stat: Awaited<ReturnType<typeof fs.stat>>;
-  let content: string;
   try {
-    [stat, content] = await Promise.all([fs.stat(transcriptPath), fs.readFile(transcriptPath, "utf8")]);
+    stat = await fs.stat(transcriptPath);
   } catch (error) {
     diagnostics.push(diagnostic("error", transcriptPath, `Could not read transcript: ${errorMessage(error)}`));
     return {
@@ -248,157 +286,196 @@ async function readTranscriptInfo(
       hasPendingApproval: false
     };
   }
-  let sessionId = parseSessionIdFromPath(transcriptPath);
-  let title: string | undefined;
-  let firstUserMessage: string | undefined;
-  let lastUserMessage: string | undefined;
-  let lastMessage: string | undefined;
-  let approvalReason: string | undefined;
-  let approvalCommand: string | undefined;
-  let lastCompletionAt: string | undefined;
-  let pendingApprovalAt: string | undefined;
-  let latestUserAt: string | undefined;
-  let latestAbortAt: string | undefined;
-  let lastCompletionMs = 0;
-  let latestUserMs = 0;
-  let latestAbortMs = 0;
-  let transcriptUsage: AgentUsage | undefined;
-  let previousUsage: AgentUsage | undefined;
-  let userTurnBaselineUsage: AgentUsage | undefined;
-  let malformedLines = 0;
-  const pendingApprovalCalls = new Map<string, number>();
 
-  for (const line of content.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) {
-      continue;
-    }
-
-    try {
-      const parsed = JSON.parse(trimmed) as {
-        timestamp?: string;
-        type?: string;
-        payload?: {
-          id?: string;
-          session_id?: string;
-          thread_name?: string;
-          type?: string;
-          role?: string;
-          message?: string;
-          content?: Array<{ type?: string; text?: string }>;
-          last_agent_message?: string;
-          completed_at?: number;
-          name?: string;
-          arguments?: string;
-          call_id?: string;
-          rate_limits?: unknown;
-          info?: unknown;
-        };
-      };
-      const timestampMs = parseTime(parsed.timestamp) ?? 0;
-
-      if (parsed.type === "session_meta") {
-        sessionId = parsed.payload?.id || parsed.payload?.session_id || sessionId;
-        title = parsed.payload?.thread_name || title;
-      }
-
-      if (
-        (parsed.type === "event_msg" && parsed.payload?.type === "user_message") ||
-        (parsed.type === "response_item" && parsed.payload?.type === "message" && parsed.payload.role === "user")
-      ) {
-        const userMessage = extractUserMessage(parsed.payload);
-        if (userMessage) {
-          latestUserAt = parsed.timestamp;
-          latestUserMs = timestampMs;
-          userTurnBaselineUsage = previousUsage;
-          lastUserMessage = userMessage;
-          if (firstUserMessage === undefined) {
-            firstUserMessage = userMessage;
-          }
-        }
-      }
-
-      if (parsed.type === "event_msg" && parsed.payload?.type === "agent_message" && parsed.payload.message) {
-        lastMessage = parsed.payload.message;
-      }
-
-      if (parsed.type === "event_msg" && parsed.payload?.type === "task_complete") {
-        lastCompletionAt = parsed.timestamp;
-        lastCompletionMs = timestampMs;
-        if (parsed.payload.last_agent_message) {
-          lastMessage = parsed.payload.last_agent_message;
-        }
-      }
-
-      if (parsed.type === "event_msg" && parsed.payload?.type === "turn_aborted") {
-        latestAbortAt = parsed.timestamp;
-        latestAbortMs = timestampMs;
-      }
-
-      if (parsed.type === "response_item" && parsed.payload?.type === "function_call" && parsed.payload.name === "exec_command") {
-        const permissionRequest = parsePermissionRequest(parsed.payload.arguments);
-        if (permissionRequest && parsed.payload.call_id) {
-          pendingApprovalCalls.set(parsed.payload.call_id, timestampMs);
-          pendingApprovalAt = parsed.timestamp;
-          approvalReason = permissionRequest.reason;
-          approvalCommand = permissionRequest.command;
-          lastMessage = formatPermissionMessage(permissionRequest);
-        }
-      }
-
-      if (parsed.type === "response_item" && parsed.payload?.type === "function_call_output" && parsed.payload.call_id) {
-        pendingApprovalCalls.delete(parsed.payload.call_id);
-      }
-
-      if (parsed.type === "event_msg" && parsed.payload?.type === "token_count") {
-        const usage = parseUsage(parsed.timestamp, parsed.payload);
-        if (usage) {
-          usage.lastUserTurnTokenUsage =
-            diffTokenUsage(usage.totalTokenUsage, userTurnBaselineUsage?.totalTokenUsage) ?? usage.lastTokenUsage;
-          usage.lastPrimaryDeltaPercent = usageDelta(usage.primary?.usedPercent, userTurnBaselineUsage?.primary?.usedPercent);
-          usage.lastSecondaryDeltaPercent = usageDelta(usage.secondary?.usedPercent, userTurnBaselineUsage?.secondary?.usedPercent);
-          previousUsage = usage;
-          transcriptUsage = usage;
-        }
-      }
-    } catch {
-      malformedLines += 1;
-      continue;
-    }
+  const cached = transcriptCache.get(transcriptPath);
+  const size = Number(stat.size);
+  const mtimeMs = Number(stat.mtimeMs);
+  const shouldReuse =
+    cached && cached.archived === archived && cached.size === size && cached.mtimeMs === mtimeMs;
+  if (shouldReuse) {
+    return finalizeTranscriptInfo(cached, stat, archived);
   }
+
+  const canAppend = cached && cached.archived === archived && size >= cached.processedBytes;
+  const state = canAppend ? cached : createTranscriptCacheEntry(transcriptPath, archived);
+  const startOffset = canAppend ? state.processedBytes : 0;
+  let malformedLines = 0;
+
+  try {
+    state.processedBytes = await processNewCompleteLines(transcriptPath, startOffset, size, (line) => {
+      try {
+        applyTranscriptLine(state, JSON.parse(line) as CodexTranscriptLine);
+      } catch {
+        malformedLines += 1;
+      }
+    });
+  } catch (error) {
+    diagnostics.push(diagnostic("error", transcriptPath, `Could not read transcript: ${errorMessage(error)}`));
+    return finalizeTranscriptInfo(state, stat, archived);
+  }
+
   if (malformedLines > 0) {
     diagnostics.push(diagnostic("warning", transcriptPath, `Skipped ${malformedLines} malformed transcript line(s).`));
   }
 
-  const hasCompletion = lastCompletionMs > 0 && lastCompletionMs >= latestUserMs && lastCompletionMs >= latestAbortMs;
-  const lastRunDurationMs = hasCompletion && latestUserMs > 0 ? lastCompletionMs - latestUserMs : undefined;
-  const latestPendingApprovalMs = Math.max(0, ...pendingApprovalCalls.values());
+  transcriptCache.set(transcriptPath, state);
+  return finalizeTranscriptInfo(state, stat, archived);
+}
+
+function createTranscriptCacheEntry(transcriptPath: string, archived: boolean): CachedTranscriptInfo {
+  return {
+    sessionId: parseSessionIdFromPath(transcriptPath),
+    path: transcriptPath,
+    mtimeMs: 0,
+    size: 0,
+    processedBytes: 0,
+    archived,
+    hasCompletion: false,
+    hasPendingApproval: false,
+    lastCompletionMs: 0,
+    latestUserMs: 0,
+    latestAbortMs: 0,
+    pendingApprovalCalls: new Map<string, number>()
+  };
+}
+
+function finalizeTranscriptInfo(
+  state: CachedTranscriptInfo,
+  stat: Awaited<ReturnType<typeof fs.stat>>,
+  archived: boolean
+): TranscriptInfo {
+  const hasCompletion =
+    state.lastCompletionMs > 0 && state.lastCompletionMs >= state.latestUserMs && state.lastCompletionMs >= state.latestAbortMs;
+  const lastRunDurationMs = hasCompletion && state.latestUserMs > 0 ? state.lastCompletionMs - state.latestUserMs : undefined;
+  const latestPendingApprovalMs = Math.max(0, ...state.pendingApprovalCalls.values());
   const hasPendingApproval =
     latestPendingApprovalMs > 0 &&
-    latestPendingApprovalMs >= latestUserMs &&
-    latestPendingApprovalMs >= lastCompletionMs &&
-    latestPendingApprovalMs >= latestAbortMs;
+    latestPendingApprovalMs >= state.latestUserMs &&
+    latestPendingApprovalMs >= state.lastCompletionMs &&
+    latestPendingApprovalMs >= state.latestAbortMs;
+
+  state.mtimeMs = Number(stat.mtimeMs);
+  state.size = Number(stat.size);
+  state.archived = archived;
+  state.hasCompletion = hasCompletion;
+  state.hasPendingApproval = hasPendingApproval;
+  state.lastRunDurationMs = lastRunDurationMs;
+  state.approvalReason = hasPendingApproval ? state.approvalReasonCandidate : undefined;
+  state.approvalCommand = hasPendingApproval ? state.approvalCommandCandidate : undefined;
+  state.lastCompletionAt = hasCompletion ? state.lastCompletionAt : undefined;
+  state.pendingApprovalAt = hasPendingApproval ? state.pendingApprovalAt : undefined;
 
   return {
-    sessionId,
-    path: transcriptPath,
-    mtimeMs: stat.mtimeMs,
+    sessionId: state.sessionId,
+    path: state.path,
+    mtimeMs: Number(stat.mtimeMs),
     archived,
-    title,
-    firstUserMessage,
-    lastUserMessage,
-    lastMessage,
-    approvalReason: hasPendingApproval ? approvalReason : undefined,
-    approvalCommand: hasPendingApproval ? approvalCommand : undefined,
-    lastCompletionAt: hasCompletion ? lastCompletionAt : undefined,
+    title: state.title,
+    firstUserMessage: state.firstUserMessage,
+    lastUserMessage: state.lastUserMessage,
+    lastMessage: state.lastMessage,
+    approvalReason: state.approvalReason,
+    approvalCommand: state.approvalCommand,
+    lastCompletionAt: state.lastCompletionAt,
     lastRunDurationMs,
-    pendingApprovalAt: hasPendingApproval ? pendingApprovalAt : undefined,
+    pendingApprovalAt: state.pendingApprovalAt,
     hasCompletion,
     hasPendingApproval,
-    usage: transcriptUsage,
-    latestUserAt,
-    latestAbortAt
+    usage: state.usage,
+    latestUserAt: state.latestUserAt,
+    latestAbortAt: state.latestAbortAt
   };
+}
+
+function applyTranscriptLine(state: CachedTranscriptInfo, parsed: CodexTranscriptLine): void {
+  const timestampMs = parseTime(parsed.timestamp) ?? 0;
+
+  if (parsed.type === "session_meta") {
+    state.sessionId = parsed.payload?.id || parsed.payload?.session_id || state.sessionId;
+    state.title = parsed.payload?.thread_name || state.title;
+  }
+
+  if (
+    (parsed.type === "event_msg" && parsed.payload?.type === "user_message") ||
+    (parsed.type === "response_item" && parsed.payload?.type === "message" && parsed.payload.role === "user")
+  ) {
+    const userMessage = extractUserMessage(parsed.payload);
+    if (userMessage) {
+      state.latestUserAt = parsed.timestamp;
+      state.latestUserMs = timestampMs;
+      state.userTurnBaselineUsage = state.previousUsage;
+      state.lastUserMessage = userMessage;
+      if (state.firstUserMessage === undefined) {
+        state.firstUserMessage = userMessage;
+      }
+    }
+  }
+
+  if (parsed.type === "event_msg" && parsed.payload?.type === "agent_message" && parsed.payload.message) {
+    state.lastMessage = parsed.payload.message;
+  }
+
+  if (parsed.type === "event_msg" && parsed.payload?.type === "task_complete") {
+    state.lastCompletionAt = parsed.timestamp;
+    state.lastCompletionMs = timestampMs;
+    if (parsed.payload.last_agent_message) {
+      state.lastMessage = parsed.payload.last_agent_message;
+    }
+  }
+
+  if (parsed.type === "event_msg" && parsed.payload?.type === "turn_aborted") {
+    state.latestAbortAt = parsed.timestamp;
+    state.latestAbortMs = timestampMs;
+  }
+
+  if (parsed.type === "response_item" && parsed.payload?.type === "function_call" && parsed.payload.name === "exec_command") {
+    const permissionRequest = parsePermissionRequest(parsed.payload.arguments);
+    if (permissionRequest && parsed.payload.call_id) {
+      state.pendingApprovalCalls.set(parsed.payload.call_id, timestampMs);
+      state.pendingApprovalAt = parsed.timestamp;
+      state.approvalReasonCandidate = permissionRequest.reason;
+      state.approvalCommandCandidate = permissionRequest.command;
+      state.lastMessage = formatPermissionMessage(permissionRequest);
+    }
+  }
+
+  if (parsed.type === "response_item" && parsed.payload?.type === "function_call_output" && parsed.payload.call_id) {
+    state.pendingApprovalCalls.delete(parsed.payload.call_id);
+  }
+
+  if (parsed.type === "event_msg" && parsed.payload?.type === "token_count") {
+    const usage = parseUsage(parsed.timestamp, parsed.payload);
+    if (usage) {
+      usage.lastUserTurnTokenUsage =
+        diffTokenUsage(usage.totalTokenUsage, state.userTurnBaselineUsage?.totalTokenUsage) ?? usage.lastTokenUsage;
+      usage.lastPrimaryDeltaPercent = usageDelta(usage.primary?.usedPercent, state.userTurnBaselineUsage?.primary?.usedPercent);
+      usage.lastSecondaryDeltaPercent = usageDelta(usage.secondary?.usedPercent, state.userTurnBaselineUsage?.secondary?.usedPercent);
+      state.previousUsage = usage;
+      state.usage = usage;
+    }
+  }
+}
+
+async function processNewCompleteLines(
+  filePath: string,
+  startOffset: number,
+  fileSize: number,
+  onLine: (line: string) => void
+): Promise<number> {
+  if (startOffset >= fileSize) {
+    return startOffset;
+  }
+
+  let processedBytes = startOffset;
+  const stream = createReadStream(filePath, { encoding: "utf8", start: startOffset, end: fileSize - 1 });
+  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+
+  for await (const line of lines) {
+    onLine(line);
+    processedBytes += Buffer.byteLength(line) + 1;
+  }
+
+  return Math.min(processedBytes, fileSize);
 }
 
 function usageDelta(current: number | undefined, previous: number | undefined): number | undefined {
